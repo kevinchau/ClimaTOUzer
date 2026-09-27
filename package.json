@@ -1,0 +1,38 @@
+{
+  "name": "climatouzer",
+  "version": "0.1.0",
+  "description": "Time-of-use pre-conditioning for heat pumps: the rate model, the window math and the learning behind a scheduler that banks cheap energy before the peak and coasts through it.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Kevin Chau",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kevinchau/ClimaTOUzer.git"
+  },
+  "homepage": "https://github.com/kevinchau/ClimaTOUzer#readme",
+  "keywords": ["time-of-use", "tou", "heat-pump", "hvac", "pre-conditioning", "demand-response", "thermostat", "energy"],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./tou": "./tou.js",
+    "./tuning": "./tuning.js",
+    "./rollup": "./rollup.js",
+    "./optimizer": "./optimizer.js",
+    "./stats": "./stats.js",
+    "./tz": "./tz.js",
+    "./holidays": "./holidays.js"
+  },
+  "files": [
+    "*.js",
+    "docs/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {}
+}
