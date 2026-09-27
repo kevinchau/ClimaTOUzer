@@ -76,6 +76,22 @@
 //     or Dry; unknown counts as not) — only units with something to do engage.
 //   armedAtOf(state, unitId) → max(state.scheduleArmedAt, units[id].scheduleEditedAt) in ms | −∞ (B F3.4).
 //
+// Instant rows (Addendum H rule 3 — a one-off row a host places deliberately, e.g. a house mode's rows):
+//   a unit's schedule may also hold {atMs, power?, mode?, temp?, coolTo?, heatTo?, fan?, since?, dryOutMin?, meta?} beside
+//   the daily {at:'HH:MM', …, days} rows. atMs is a finite epoch ms; power is optional (a row without it only sets a
+//   running unit's setpoint — resolveEntry then resolves its pair from the run context and writes neither power nor
+//   mode; labels read "heat to 62°", without "On ·"); `days` does not apply. unitEntries lists them after the daily rows
+//   (normalised, since → epoch ms, meta untouched). instantRows(cfg, tz, unitCfg) → every instant row as an instant
+//   {key: 'i:' + new Date(atMs).toISOString() (UTC — no collision in the repeated DST hour), at, date, hhmm (via tz),
+//   fields, since?, dryOutMin?, meta?}; two rows at one instant share the key and the one that sorts last is kept.
+//   entryInstants(date) includes the instant rows of that local date. latestEntryAtOrBefore / entryInEffect / nextEntry /
+//   eventEntry consider every instant row directly (no D−1/D bound) and never disarm one by armedAt (the host's 12 h
+//   fire horizon expires it); nextEntry keeps its 24 h bound. Ties at one instant: daily rows first, then instant rows
+//   by since — the last is the one in effect. Nothing here reads meta: plan() passes it through (entries[u][j] gain
+//   since (ISO), dryOutMin, meta and house = meta.house; an instant row never starts early) and a row carrying
+//   meta.house marks the day as markers kind 'house' (a folded one stays 'folded'; lines carry `house`); entryDryOut
+//   uses an Off instant row's dryOutMin when set. A plan without instant rows is byte-identical.
+//
 // Keep-mode entries and the cool-to / heat-to pair (Addendum F; the one definition — the reference app's system.js
 // re-exports these and adds the run context it computes):
 //   An On entry may omit `mode` — it KEEPS the mode (the unit runs whatever mode the host's run context gives it) — and
@@ -391,12 +407,14 @@ export function foldEventFor(cfg, tz, unitCfg, at, eff) {
 
 const DAYS_RANK = Object.fromEntries(ENTRY_DAYS.map((d, i) => [d, i]))
 
-/** Normalised, sorted entries of a unit (see header). */
+/** Normalised, sorted entries of a unit: the daily rows, then the instant rows (see header). */
 export function unitEntries(unitCfg) {
   const list = Array.isArray(unitCfg?.schedule) ? unitCfg.schedule : []
   const out = []
+  const inst = []
   for (const x of list) {
     if (!x || typeof x !== 'object') continue
+    if (x.atMs !== undefined) { const r = instantRow(x); if (r) inst.push(r); continue }
     let min
     try { min = hhmmToMin(x.at) } catch { continue }
     if (min >= 1440 || !/^\d{2}:\d{2}$/.test(x.at)) continue
@@ -411,11 +429,41 @@ export function unitEntries(unitCfg) {
     e.days = x.days ?? 'all'
     out.push(e)
   }
-  return out.sort((a, b) => a.min - b.min || (DAYS_RANK[a.days] ?? 9) - (DAYS_RANK[b.days] ?? 9))
+  out.sort((a, b) => a.min - b.min || (DAYS_RANK[a.days] ?? 9) - (DAYS_RANK[b.days] ?? 9))
+  return inst.length ? [...out, ...inst.sort(byAtThenSince('atMs'))] : out
+}
+
+// Addendum H: one instant row {atMs, power?, mode?, temp?, coolTo?, heatTo?, fan?, since?, dryOutMin?, meta?} normalised
+// like a daily row (an Off row carries no other field) | null (atMs not a finite epoch ms, a named power not ON/OFF, or
+// no field at all). since → epoch ms; dryOutMin a number ≥ 0; meta passed through untouched.
+function instantRow(x) {
+  if (typeof x.atMs !== 'number' || !Number.isFinite(x.atMs)) return null
+  const e = { atMs: x.atMs }
+  if (x.power != null && x.power !== '') {
+    e.power = typeof x.power === 'boolean' ? (x.power ? 'ON' : 'OFF') : String(x.power).toUpperCase()
+    if (e.power !== 'ON' && e.power !== 'OFF') return null
+  }
+  if (e.power !== 'OFF') {
+    if (x.mode != null && x.mode !== '') e.mode = String(x.mode).toUpperCase()
+    for (const k of SETPOINTS) if (x[k] != null && x[k] !== '' && Number.isFinite(Number(x[k]))) e[k] = Number(x[k])
+    if (x.fan != null && x.fan !== '') e.fan = String(x.fan).toUpperCase()
+  }
+  if (Object.keys(e).length === 1) return null
+  const since = msOf(x.since)
+  if (since != null) e.since = since
+  if (x.dryOutMin != null && x.dryOutMin !== '' && Number(x.dryOutMin) >= 0) e.dryOutMin = Number(x.dryOutMin)
+  if (x.meta && typeof x.meta === 'object') e.meta = x.meta
+  return e
+}
+
+// Sort by instant, ties daily first, then instant rows by since (the later one is the one in effect).
+function byAtThenSince(k) {
+  const isI = (x) => ((x.key ? x.key.startsWith('i:') : x.atMs !== undefined) ? 1 : 0)
+  return (a, b) => a[k] - b[k] || isI(a) - isI(b) || (a.since ?? a[k]) - (b.since ?? b[k])
 }
 
 function entryFields(e) {
-  const f = { power: e.power }
+  const f = e.power !== undefined ? { power: e.power } : {}
   for (const k of ['mode', 'temp', 'coolTo', 'heatTo', 'fan']) if (e[k] !== undefined) f[k] = e[k]
   return f
 }
@@ -439,19 +487,22 @@ export function setpointFor(fields, season) {
 /** rule 3: the concrete fields an entry means for a run context rc {mode, season, writeMode} (see header). */
 export function resolveEntry(fields, rc) {
   if (!fields || typeof fields !== 'object') return fields
-  if (up(fields.power) !== 'ON' || (!hasPair(fields) && !keepsMode(fields))) return { ...fields }
-  const keep = keepsMode(fields)
-  const m = keep ? rc?.writeMode ?? null : fields.mode
-  const t = setpointFor(fields, keep ? rc?.season ?? null : seasonOfMode(fields.mode))
-  return { power: fields.power, ...(m ? { mode: m } : {}), ...(t != null ? { temp: t } : {}), ...(fields.fan != null ? { fan: fields.fan } : {}) }
+  const bare = fields.power == null // Addendum H: an instant row naming no power — it sets a running unit's setpoint
+  if ((!bare && up(fields.power) !== 'ON') || (!hasPair(fields) && !keepsMode(fields))) return { ...fields }
+  const m = keepsMode(fields) ? rc?.writeMode ?? null : fields.mode
+  const t = setpointFor(fields, followsRun(fields) ? rc?.season ?? null : seasonOfMode(fields.mode))
+  return { ...(bare ? {} : { power: fields.power }), ...(m ? { mode: m } : {}), ...(t != null ? { temp: t } : {}), ...(fields.fan != null ? { fan: fields.fan } : {}) }
 }
 
 /** The EntryDTO / activity-line view of a resolution: {season, mode?, temp?} (keys only when present). */
 export function entryResolution(fields, rc) {
   const R = resolveEntry(fields, rc) ?? {}
-  const season = keepsMode(fields) ? rc?.season ?? null : seasonOfMode(fields?.mode)
+  const season = followsRun(fields) ? rc?.season ?? null : seasonOfMode(fields?.mode)
   return { season, ...(R.mode != null ? { mode: R.mode } : {}), ...(R.temp != null ? { temp: R.temp } : {}) }
 }
+
+// The entry's season is the run context's: it keeps the mode, or it is a row without power that names no mode (H).
+function followsRun(fields) { return keepsMode(fields) || (!!fields && fields.power == null && (fields.mode == null || fields.mode === '')) }
 
 // The run context a projection uses when the host injects none (opts.runContext): the remembered mode — the stranded
 // one, then the read's — for a unit that is off; the read's for a unit that is on. Never a mode to write.
@@ -461,13 +512,34 @@ function rememberedRc(us, live) {
   return { masterMode: null, mode: m == null ? null : up(m), season: seasonOfMode(m), writeMode: null, source: m == null ? null : on ? 'live' : 'remembered' }
 }
 
-/** Entry instants of one local date, filtered by day type (see header). */
+/** Entry instants of one local date: the daily rows filtered by day type and the instant rows of that date (see header). */
 export function entryInstants(cfg, tz, unitCfg, date) {
+  const out = dailyInstants(cfg, tz, unitCfg, date)
+  const inst = instantRows(cfg, tz, unitCfg).filter((x) => x.date === date)
+  return inst.length ? [...out, ...inst].sort(byAtThenSince('at')) : out
+}
+
+/** Addendum H: every instant row of a unit, whatever its date (see header). */
+export function instantRows(cfg, tz, unitCfg) {
+  const byKey = new Map()
+  for (const e of unitEntries(unitCfg)) {
+    if (e.atMs === undefined) continue
+    const p = tz.localParts(e.atMs)
+    const x = { key: `i:${new Date(e.atMs).toISOString()}`, at: e.atMs, date: p.date, hhmm: p.hhmm, fields: entryFields(e) }
+    for (const k of ['since', 'dryOutMin', 'meta']) if (e[k] !== undefined) x[k] = e[k]
+    byKey.delete(x.key) // two rows at one instant share its key: the one that sorts last is the row
+    byKey.set(x.key, x)
+  }
+  return [...byKey.values()]
+}
+
+// The daily rows of one local date as instants (the pre-H entryInstants).
+function dailyInstants(cfg, tz, unitCfg, date) {
   const dt = dayType(cfg, date)
   const seen = new Set()
   const out = []
   for (const e of unitEntries(unitCfg)) {
-    if (!entryOnDay(e.days, dt)) continue
+    if (e.atMs !== undefined || !entryOnDay(e.days, dt)) continue
     const key = `s:${date}@${e.at}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -488,8 +560,9 @@ export function latestEntryAtOrBefore(cfg, tz, unitCfg, instant, armedAt) {
   const date = tz.localParts(instant).date
   let best = null
   for (const d of [addDays(date, -1), date]) {
-    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at <= instant && x.at > armed && (!best || x.at >= best.at)) best = x
+    for (const x of dailyInstants(cfg, tz, unitCfg, d)) if (x.at <= instant && x.at > armed && (!best || x.at >= best.at)) best = x
   }
+  for (const x of instantRows(cfg, tz, unitCfg)) if (x.at <= instant && (!best || x.at >= best.at)) best = x
   return best
 }
 
@@ -502,10 +575,12 @@ export function entryInEffect(cfg, tz, unitCfg, now, armedAt) {
 export function nextEntry(cfg, tz, unitCfg, now, armedAt) {
   const armed = armedMs(armedAt)
   const date = tz.localParts(now).date
+  let best = null
   for (const d of [date, addDays(date, 1)]) {
-    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at > now && x.at > armed && x.at <= now + 86400000) return x
+    for (const x of dailyInstants(cfg, tz, unitCfg, d)) if (!best && x.at > now && x.at > armed && x.at <= now + 86400000) best = x
   }
-  return null
+  for (const x of instantRows(cfg, tz, unitCfg)) if (x.at > now && x.at <= now + 86400000 && (!best || x.at <= best.at)) best = x
+  return best
 }
 
 /** B F3.12 + E E1.6: the latest entry with preStart ≤ t ≤ max(peakStart, now) ∧ (t < peakEnd ∨ t = peakStart) ∧ t > armedAt (see header). */
@@ -514,10 +589,12 @@ export function eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt) {
   const armed = armedMs(armedAt)
   const hi = Math.max(event.peakStart, Number.isFinite(now) ? now : -Infinity)
   const date = event.date ?? String(event.id).split('@')[0]
+  const inWindow = (x) => x.at >= preStart && x.at <= hi && (x.at < event.peakEnd || x.at === event.peakStart)
   let best = null
   for (const d of [addDays(date, -1), date]) {
-    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at >= preStart && x.at <= hi && (x.at < event.peakEnd || x.at === event.peakStart) && x.at > armed && (!best || x.at >= best.at)) best = x
+    for (const x of dailyInstants(cfg, tz, unitCfg, d)) if (inWindow(x) && x.at > armed && (!best || x.at >= best.at)) best = x
   }
+  for (const x of instantRows(cfg, tz, unitCfg)) if (inWindow(x) && (!best || x.at >= best.at)) best = x
   return best
 }
 
@@ -645,12 +722,15 @@ function timeLabel(tz, ms) { return typeof tz.formatLocal === 'function' ? tz.fo
 function entryRef(tz, x, rc) {
   if (!x) return null
   const at = msOf(x.at)
-  const out = { key: x.key ?? null, at: iso(at), atLabel: at == null ? '' : hmm(tz, at), label: entryLabel(x.fields) }
+  const out = { key: x.key ?? null, at: iso(at), atLabel: at == null ? '' : hmm(tz, at), label: rowLabel(x.fields) }
   if (!resolves(x.fields)) return out
   out.resolved = resolutionOf(x, rc)
-  out.label = entryLabel(x.fields, { season: out.resolved.season })
+  out.label = rowLabel(x.fields, { season: out.resolved.season })
   return out
 }
+
+// entryLabel, but a row naming no power (Addendum H's setpoint-only instant row) reads without "On ·": "heat to 62°".
+function rowLabel(fields, opts) { return fields?.power == null ? settingLabel(fields, opts) : entryLabel(fields, opts) }
 
 // {season, mode?, temp?} of a resolving entry: a persisted auto.entry carries its own (decide's), else from rc.
 function resolutionOf(x, rc) {
@@ -695,7 +775,8 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
     precondition: 'off', shed, preStart: null, target: null, source: null,
     fanOnlyUntil: iso(planDryOut(cfg, e, shed, auto, active, runSrc, live?.caps)),
     entry: entryRef(tz, E, rcPeak),
-    restore: !R ? null : R.fields?.power === 'OFF' ? 'stays off' : settingLabel(restoreOf(R)),
+    // a row without power (H) restores its season's setpoint in F's verb form ("heat to 62°")
+    restore: !R ? null : R.fields?.power === 'OFF' ? 'stays off' : R.fields?.power == null ? settingLabel(R.fields, { season: resolutionOf(R, rcAt(msOf(R.at))).season }) : settingLabel(restoreOf(R)),
     dryout: shed === 'off' && e.kind !== 'boundary' ? dryoutSkipText(dryoutSkip) : null, // a boundary never sheds (E1.4)
   }
   if (!e.precondition || u.shed === false || u.precondition === false) return res
@@ -785,12 +866,20 @@ function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedA
   return entryInstants(cfg, tz, u, date).map((x) => {
     const ev = foldEventFor(cfg, tz, u, x.at, effFor)
     const skipped = ev && (us?.skipDate === ev.date || ledger?.[ev.id]?.status === 'skipped')
-    const out = { key: x.key, at: iso(x.at), atLabel: hmm(tz, x.at), label: entryLabel(x.fields), fields: x.fields, folded: ev && !skipped ? ev.id : null, days: x.days }
-    if (x.fields.power !== 'ON') return out
+    const out = { key: x.key, at: iso(x.at), atLabel: hmm(tz, x.at), label: rowLabel(x.fields), fields: x.fields, folded: ev && !skipped ? ev.id : null, days: x.days }
+    const instant = x.key.startsWith('i:')
+    if (instant) { // Addendum H: an instant row has no day types; since/dryOutMin/meta ride along, meta.house as `house`
+      delete out.days
+      if (x.since !== undefined) out.since = iso(x.since)
+      if (x.dryOutMin !== undefined) out.dryOutMin = x.dryOutMin
+      if (x.meta !== undefined) { out.meta = x.meta; if (x.meta.house !== undefined) out.house = x.meta.house }
+    }
+    if (x.fields.power === 'OFF') return out
     if (resolves(x.fields)) { // Addendum F: the resolution at the entry's instant, and the label in its season
       out.resolved = entryResolution(x.fields, rcAt(x.at))
-      out.label = entryLabel(x.fields, { season: out.resolved.season })
+      out.label = rowLabel(x.fields, { season: out.resolved.season })
     }
+    if (instant) return out // a one-off row never starts early
     if (earlyRes && earlyRes.entry?.key === x.key && Number.isFinite(msOf(earlyRes.startAt))) {
       out.startAt = iso(msOf(earlyRes.startAt))
       out.lead = earlyRes.lead ?? null
@@ -808,10 +897,9 @@ function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedA
 function planEntryDryOut(cfg, live, list, now) {
   if (!live || String(live.power ?? '').toUpperCase() !== 'ON' || !hasFan(live.caps)) return undefined
   const s = seasonOfMode(live.mode)
-  const min = s ? Number(pick(cfg?.shed?.fanOnlyMin, s) ?? FAN_ONLY_MIN[s]) : 0
-  if (!(min > 0)) return undefined
-  const x = list.find((y) => y.fields.power === 'OFF' && msOf(y.at) > now)
-  return x ? { until: iso(msOf(x.at) + min * MIN_MS) } : undefined
+  const x = s ? list.find((y) => y.fields.power === 'OFF' && msOf(y.at) > now) : null
+  const min = x ? Number(x.dryOutMin ?? pick(cfg?.shed?.fanOnlyMin, s) ?? FAN_ONLY_MIN[s]) : 0 // an instant row's own minutes (H)
+  return min > 0 ? { until: iso(msOf(x.at) + min * MIN_MS) } : undefined
 }
 
 // PlanDay.markers (addendum D E4.4/§1.6): entry marks grouped by (kind, at) across units, with structured lines.
@@ -830,7 +918,7 @@ function planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf) {
     let dryEntry = null
     if (untilMs != null) for (const x of list) if (x.fields.power === 'OFF' && msOf(x.at) < untilMs && (!dryEntry || msOf(x.at) > msOf(dryEntry.at))) dryEntry = x
     for (const x of list) {
-      const line = { unit: u.id, name: u.name ?? u.id, at: x.at, label: x.label, note: null }
+      const line = { unit: u.id, name: u.name ?? u.id, at: x.at, label: x.label, note: null, ...(x.house !== undefined ? { house: x.house } : {}) }
       if (x.folded) {
         const ev = evById.get(x.folded)
         const end = msOf(ev?.peakEnd)
@@ -845,7 +933,7 @@ function planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf) {
         line.note = `starts ~${timeLabel(tz, msOf(x.startAt))}${Number.isFinite(room) ? ` (room ${fmtNum(room)}°)` : ''}`
       } else if (x.earlyMax) line.note = `may start up to ${x.earlyMax} min early`
       else if (x === dryEntry) line.note = `fan-only, then off at ${timeLabel(tz, untilMs)}`
-      add({ at: x.at, kind: 'entry', units: [u.id], lines: [line] })
+      add({ at: x.at, kind: x.house !== undefined ? 'house' : 'entry', units: [u.id], lines: [line] })
       if (x.startAt) add({ at: x.startAt, end: x.at, kind: 'start', units: [u.id], lines: [] })
       if (x === dryEntry) add({ at: x.at, end: dry.until, kind: 'dryout', units: [u.id], lines: [] })
     }

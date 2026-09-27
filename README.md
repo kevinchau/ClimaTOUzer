@@ -48,6 +48,10 @@ through an injected time zone, so results are identical on any machine.
   `tou.entryInEffect`, `tou.nextEntry`, `tou.entryEffFor`) and `tou.plan`, one printable day with per-unit texts.
   An On entry may keep the mode and carry a cool-to / heat-to pair; `tou.resolveEntry` turns it into concrete
   settings for the mode the unit will run, which the host supplies as a run context.
+- **Instant rows.** A unit's schedule may also hold one-off rows at absolute instants (`{atMs, …, since?, dryOutMin?,
+  meta?}`, key `i:<UTC instant>`) that a host places deliberately — the reference app's house modes (Standard, Left
+  Home, Vacation) replace a unit's daily rows with them. Power is optional (a row without it only sets a running
+  unit's setpoint); every lookup considers them at any age and never disarms one; `meta` is passed through untouched.
 - **Effective parameters per season, frozen at take.** `tuning.effectivePrecondition` resolves the base or tuned
   Δ and lead with a read-time guardrail clamp; `tuning.snapshotParams` freezes them when a run starts so nothing can
   move a running window.
@@ -235,9 +239,10 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `activeEventFor(cfg, tz, unitCfg, now, eff?)` | `{event, phase: 'precondition' \| 'shed', preStart}` or null |
 | `eventOverlapping(cfg, tz, unitCfg, from, to, eff?)` | true when a participating event overlaps `[from, to]` |
 | `foldEventFor(cfg, tz, unitCfg, at, eff?)` | the event whose window contains an entry instant, or null |
-| `unitEntries(unitCfg)` | the unit's daily entries, normalised and sorted |
-| `entryInstants(cfg, tz, unitCfg, date)` | that date's entries as instants `[{key, at, date, hhmm, days, fields}]` |
-| `latestEntryAtOrBefore(cfg, tz, unitCfg, instant, armedAt?)` | the latest entry at or before `instant`, or null |
+| `unitEntries(unitCfg)` | the unit's daily entries, normalised and sorted, then its instant rows `{atMs, …}` |
+| `entryInstants(cfg, tz, unitCfg, date)` | that date's entries as instants `[{key, at, date, hhmm, days, fields}]`, its instant rows included (key `i:<UTC ISO>`, no `days`, with `since`/`dryOutMin`/`meta` when set) |
+| `instantRows(cfg, tz, unitCfg)` | every instant row of the unit as an instant, whatever its date |
+| `latestEntryAtOrBefore(cfg, tz, unitCfg, instant, armedAt?)` | the latest entry at or before `instant`, or null (an instant row at any age, never disarmed; at one instant the instant row wins) |
 | `entryInEffect(cfg, tz, unitCfg, now, armedAt?)` | the entry in effect at `now`, or null |
 | `nextEntry(cfg, tz, unitCfg, now, armedAt?)` | the next entry within 24 hours, or null |
 | `eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt?)` | the entry that sets an event's target, or null |
@@ -245,7 +250,7 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `entryEffFor(cfg, tz, unitCfg, unitState, liveMode, opts?)` | `(event) => eff`, per-event parameters for `activeEventFor` |
 | `keepsMode(fields)`, `hasPair(fields)`, `resolves(fields)` | an On entry that keeps the mode (names none); one that carries `coolTo`/`heatTo`; either |
 | `setpointFor(fields, season)` | the setpoint an entry gives a season: `temp`, else `coolTo` (cooling) / `heatTo` (heating) |
-| `resolveEntry(fields, rc)` | the concrete `{power, mode?, temp?, fan?}` an entry means for a run context `{mode, season, writeMode}` (identity for an entry that names a mode without the pair) |
+| `resolveEntry(fields, rc)` | the concrete `{power, mode?, temp?, fan?}` an entry means for a run context `{mode, season, writeMode}` (identity for an entry that names a mode without the pair; a row without power gives `{temp?, fan?}`) |
 | `entryResolution(fields, rc)` | `{season, mode?, temp?}`, the resolution as plans and activity lines show it |
 | `plan(cfg, state, tz, date, opts?)` | one printable day: segments, events with per-unit texts, entries, markers (`opts.runContext` resolves entries that keep the mode) |
 

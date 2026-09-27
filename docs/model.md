@@ -106,6 +106,16 @@ and `resolveEntry(fields, rc)` turns the entry into concrete fields (`setpointFo
 entry that names a mode without the pair resolves to itself. `plan` takes the run context per unit as
 `opts.runContext`; without it a keep-mode entry is read in the unit's remembered mode.
 
+**Instant rows.** Beside its daily entries a unit's schedule may hold one-off rows at absolute instants,
+`{atMs, power?, mode?, temp?, coolTo?, heatTo?, fan?, since?, dryOutMin?, meta?}`, that a host places deliberately (the
+reference app's house modes replace a unit's daily rows with them while the house is away). Their key is
+`i:` plus the UTC instant (no collision in the repeated DST hour); `power` is optional — a row without it only sets a
+running unit's setpoint, resolving its pair from the run context; `since` is the instant a host's "the person changed
+it since" test reads; `dryOutMin` the fan-only minutes of an Off row; `meta` is the host's and passes through. Every
+lookup considers an instant row at any age and never disarms one; at one instant the daily row sorts first and the
+instant row is the one in effect. `plan` lists them in `entries` (with `since`, `meta` and `meta.house` as `house`)
+and a row carrying `meta.house` as a `house` marker.
+
 `plan(cfg, state, tz, date, opts)` assembles all of the above into one printable day: segments, events with
 per-unit texts ("heat +3° → 73° from 5:00"), entries and markers.
 

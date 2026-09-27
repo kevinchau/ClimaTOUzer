@@ -1300,3 +1300,127 @@ test('F plan: an explicit entry with the pair (the named season), and explicit e
     assert.ok(!JSON.stringify(a).includes('resolved'))
   }
 })
+
+// ---- Addendum H: instant rows (one-shots at absolute instants, key i:<UTC ISO>) ------------------------------------
+
+const TUE = '2026-09-29'
+const LEFT = { coolTo: 80, heatTo: 62 } // Left Home's setpoint-only keep row
+const iKey = (ms) => `i:${new Date(ms).toISOString()}`
+function withRows(rows, id = 'kitchen') { return withSched(rows, id) }
+
+test('H unitEntries: instant rows {atMs, …} beside the daily rows — power optional, since/dryOutMin/meta kept, malformed dropped', () => {
+  const since = L(TUE, '08:10')
+  const { u } = withRows([
+    { at: '22:00', power: 'OFF' },
+    { atMs: L(TUE, '17:40'), power: true, mode: 'heat', temp: '70', fan: 'low', since: new Date(since).toISOString(), meta: { house: 'return' } },
+    { atMs: L(TUE, '08:10'), ...LEFT, since, meta: { house: 'left-home' } },
+    { atMs: L(TUE, '09:00'), power: 'OFF', mode: 'COOL', dryOutMin: 10, since },
+    { at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 },
+    { atMs: NaN, power: 'OFF' }, // not finite
+    { atMs: '2026-09-29T15:10:00.000Z', power: 'OFF' }, // atMs is epoch ms
+    { atMs: L(TUE, '10:00'), power: 'maybe' }, // a named power must be ON/OFF
+    { atMs: L(TUE, '11:00'), since }, // names nothing
+  ])
+  assert.deepEqual(tou.unitEntries(u), [
+    { at: '07:00', min: 420, power: 'ON', mode: 'HEAT', temp: 70, days: 'all' },
+    { at: '22:00', min: 1320, power: 'OFF', days: 'all' },
+    { atMs: L(TUE, '08:10'), coolTo: 80, heatTo: 62, since, meta: { house: 'left-home' } },
+    { atMs: L(TUE, '09:00'), power: 'OFF', since, dryOutMin: 10 },
+    { atMs: L(TUE, '17:40'), power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW', since, meta: { house: 'return' } },
+  ])
+})
+
+test('H entryInstants / instantRows: an instant row on its local date, key i:<UTC ISO>, fields with the pair, since/dryOutMin/meta on the instant', () => {
+  const at = L(TUE, '08:10')
+  const { cfg, u } = withRows([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 }, { at: '22:00', power: 'OFF' },
+    { atMs: at, ...LEFT, since: at, meta: { house: 'left-home' } }, { atMs: L(TUE, '14:05'), power: 'OFF', dryOutMin: 10, since: L(TUE, '14:05') }])
+  const list = tou.entryInstants(cfg, tz, u, TUE)
+  assert.deepEqual(list.map((x) => [x.key, x.hhmm]), [[`s:${TUE}@07:00`, '07:00'], [iKey(at), '08:10'], [iKey(L(TUE, '14:05')), '14:05'], [`s:${TUE}@22:00`, '22:00']])
+  assert.equal(iKey(at), 'i:2026-09-29T15:10:00.000Z')
+  assert.deepEqual(list[1], { key: 'i:2026-09-29T15:10:00.000Z', at, date: TUE, hhmm: '08:10', fields: { coolTo: 80, heatTo: 62 }, since: at, meta: { house: 'left-home' } })
+  assert.deepEqual([list[2].fields, list[2].dryOutMin], [{ power: 'OFF' }, 10])
+  assert.deepEqual(tou.entryInstants(cfg, tz, u, '2026-09-30').map((x) => x.key), ['s:2026-09-30@07:00', 's:2026-09-30@22:00'], 'only on its own local date')
+  assert.deepEqual(tou.instantRows(cfg, tz, u).map((x) => x.key), [iKey(at), iKey(L(TUE, '14:05'))], 'every instant row, whatever the date')
+  // the repeated DST hour: two instants an hour apart read 01:30 both, and keep distinct keys (UTC)
+  const a = Date.parse('2026-11-01T08:30:00Z')
+  const b = Date.parse('2026-11-01T09:30:00Z')
+  const dst = withRows([{ atMs: a, power: 'OFF' }, { atMs: b, power: 'OFF' }])
+  const d = tou.entryInstants(dst.cfg, tz, dst.u, '2026-11-01')
+  assert.deepEqual(d.map((x) => [x.hhmm, x.key]), [['01:30', 'i:2026-11-01T08:30:00.000Z'], ['01:30', 'i:2026-11-01T09:30:00.000Z']])
+  // two rows at one instant share its key: the one that sorts last (the newer since) is the row
+  const same = withRows([{ atMs: at, power: 'OFF', since: at }, { atMs: at, power: 'ON', mode: 'HEAT', since: at + 1 }])
+  assert.deepEqual(tou.instantRows(same.cfg, tz, same.u).map((x) => x.fields.power), ['ON'])
+})
+
+test('H lookups: an instant row is considered at any age and never disarmed; a newer daily row wins; ties daily first, then by since', () => {
+  const sunday = L(SUN, '14:00')
+  const { cfg, u } = withRows([{ atMs: sunday, power: 'OFF', since: sunday, meta: { house: 'vacation' } }])
+  const WEDn = L('2026-09-30', '12:00')
+  assert.equal(tou.entryInEffect(cfg, tz, u, WEDn)?.key, iKey(sunday), 'a Sunday row on Wednesday: no D−1/D bound')
+  assert.equal(tou.latestEntryAtOrBefore(cfg, tz, u, WEDn, WEDn - 1)?.key, iKey(sunday), 'armedAt never disarms an instant row')
+  assert.equal(tou.entryInEffect(cfg, tz, u, sunday - 1), null, 'not before its instant')
+  // a daily row newer than the instant row wins
+  const mixed = withRows([{ atMs: L(TUE, '08:10'), ...LEFT, since: L(TUE, '08:10') }, { at: '22:00', power: 'OFF' }])
+  assert.equal(tou.entryInEffect(mixed.cfg, tz, mixed.u, L(TUE, '21:00'))?.key, iKey(L(TUE, '08:10')))
+  assert.equal(tou.entryInEffect(mixed.cfg, tz, mixed.u, L(TUE, '22:30'))?.key, `s:${TUE}@22:00`)
+  assert.equal(tou.entryInEffect(mixed.cfg, tz, mixed.u, L(TUE, '22:30'), L(TUE, '22:10'))?.key, iKey(L(TUE, '08:10')), 'the daily row armed past, the instant row stays')
+  // at one instant: daily first, then the instant row (it is the one in effect)
+  const tie = withRows([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 73 }, { atMs: L(TUE, '07:00'), power: 'ON', mode: 'HEAT', temp: 70, since: L(TUE, '08:10') }])
+  assert.deepEqual(tou.entryInstants(tie.cfg, tz, tie.u, TUE).map((x) => x.key), [`s:${TUE}@07:00`, iKey(L(TUE, '07:00'))])
+  assert.equal(tou.entryInEffect(tie.cfg, tz, tie.u, L(TUE, '07:05')).fields.temp, 70)
+  assert.equal(tou.nextEntry(tie.cfg, tz, tie.u, L(TUE, '06:00')).fields.temp, 70, 'nextEntry: the row in effect at that instant')
+})
+
+test('H nextEntry / eventEntry: a future instant row (never disarmed), an instant row inside the event window', () => {
+  const { cfg, u } = withRows([{ at: '22:00', power: 'OFF' }, { atMs: L(TUE, '16:30'), power: 'ON', mode: 'COOL', temp: 76, since: L(SUN, '14:00') }])
+  assert.equal(tou.nextEntry(cfg, tz, u, L(TUE, '12:00'))?.key, iKey(L(TUE, '16:30')))
+  assert.equal(tou.nextEntry(cfg, tz, u, L(TUE, '12:00'), L(TUE, '18:00'))?.key, iKey(L(TUE, '16:30')), 'armedAt ignored for it')
+  assert.equal(tou.nextEntry(cfg, tz, u, L(TUE, '16:30'))?.key, `s:${TUE}@22:00`, 'strictly after now')
+  const far = withRows([{ atMs: L(TUE, '16:30') + 86400000 + 60000, power: 'OFF' }])
+  assert.equal(tou.nextEntry(far.cfg, tz, far.u, L(TUE, '16:30')), null, 'within 24 h')
+  // the 17:00 peak (not pre-conditioned in this fixture): a Left Home row at 17:40 folds; armedAt ignored for it
+  const lh = withRows([{ atMs: L(TUE, '17:40'), ...LEFT, since: L(TUE, '17:40'), meta: { house: 'return' } }])
+  const ev = tou.events(lh.cfg, tz, TUE)[1]
+  const x = tou.eventEntry(lh.cfg, tz, lh.u, ev, ev.peakStart, L(TUE, '18:00'), L(TUE, '17:50'))
+  assert.deepEqual([x?.key, x?.meta], [iKey(L(TUE, '17:40')), { house: 'return' }])
+  assert.equal(tou.eventEntry(lh.cfg, tz, lh.u, ev, ev.peakStart, L(TUE, '17:30')), null, 'not yet (after now)')
+  assert.equal(tou.foldEventFor(lh.cfg, tz, lh.u, L(TUE, '17:40'))?.id, `${TUE}@17:00`)
+})
+
+test('H resolveEntry: a row without power resolves its pair from the run context and writes neither power nor mode', () => {
+  assert.deepEqual(tou.resolveEntry(LEFT, RC_HEAT), { temp: 62 })
+  assert.deepEqual(tou.resolveEntry({ ...LEFT, fan: 'LOW' }, { mode: 'COOL', season: 'cooling', writeMode: 'COOL' }), { temp: 80, fan: 'LOW' })
+  assert.deepEqual(tou.resolveEntry(LEFT, { mode: 'FAN', season: null, writeMode: null }), {})
+  assert.deepEqual(tou.entryResolution(LEFT, RC_HEAT), { season: 'heating', temp: 62 })
+  assert.deepEqual(tou.resolveEntry({ temp: 70 }, RC_HEAT), { temp: 70 }, 'no pair: a copy')
+  assert.equal(tou.resolves(LEFT), true)
+  assert.equal(tou.keepsMode(LEFT), false, 'no power ON: nothing to keep a mode for')
+})
+
+test('H plan(): instant rows in entries[u] with since/meta/house, a house marker, a folded row restores per F’s labels; daily-only plans unchanged', () => {
+  const at = L(TUE, '08:10')
+  const { cfg } = withRows([{ at: '22:00', power: 'OFF' }, { atMs: at, ...LEFT, since: at, meta: { house: 'left-home' } },
+    { atMs: L(TUE, '12:30'), power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW', since: at, meta: { house: 'return' } }])
+  cfg.precondition.optimumStart = 60
+  const st = { units: {}, ledger: {} }
+  const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW' } }
+  const p = tou.plan(cfg, st, tz, TUE, { live, runContext: { kitchen: () => RC_HEAT } })
+  const [lh, ret, off] = p.entries.kitchen
+  assert.deepEqual(lh, { key: iKey(at), at: ISOL(TUE, '08:10'), atLabel: '8:10', label: 'heat to 62°', fields: { coolTo: 80, heatTo: 62 }, folded: `${TUE}@07:00`,
+    resolved: { season: 'heating', temp: 62 }, since: ISOL(TUE, '08:10'), meta: { house: 'left-home' }, house: 'left-home' })
+  assert.deepEqual([ret.label, ret.folded, ret.house, ret.earlyMax, ret.startAt], ['On · Heat 70° · Low', null, 'return', undefined, undefined], 'an instant row never starts early')
+  assert.equal(off.key, `s:${TUE}@22:00`)
+  assert.equal(p.events[0].units.kitchen.restore, 'heat to 62°', 'the folded Left Home row restores its season’s setpoint')
+  const m = p.markers.find((x) => x.kind === 'house')
+  assert.deepEqual([m?.at, m?.lines[0].label, m?.lines[0].house], [ISOL(TUE, '12:30'), 'On · Heat 70° · Low', 'return'])
+  assert.equal(p.markers.find((x) => x.kind === 'folded').lines[0].house, 'left-home')
+  // an Off instant row's dry-out minutes (entryDryOut)
+  const d = withRows([{ atMs: L(TUE, '14:05'), power: 'OFF', dryOutMin: 10, since: L(TUE, '14:05') }])
+  const pd = tou.plan(d.cfg, st, tz, TUE, { live: { kitchen: { power: 'ON', mode: 'COOL', temp: 81 } }, now: L(TUE, '14:00') })
+  assert.deepEqual(pd.units.kitchen.entryDryOut, { until: ISOL(TUE, '14:15') })
+  assert.equal(pd.entries.kitchen[0].dryOutMin, 10)
+  // daily rows only: no key of the instant rows appears (J40)
+  const daily = tou.plan(withSched(KITCHEN_SCHED).cfg, st, tz, THU, { live })
+  assert.ok(!/"(since|meta|house|dryOutMin)"/.test(JSON.stringify(daily)))
+  assert.ok(!daily.markers.some((x) => x.kind === 'house'))
+})
