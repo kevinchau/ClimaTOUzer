@@ -92,12 +92,19 @@ date also gets one *boundary event* per super off-peak to off-peak step of its t
 and simply stops at `t`, banking super off-peak energy before the tier rises, with nothing to shed. Only units
 with something to do engage (a unit that reads ON in a pre-conditioning mode, or has an ON scheduled entry).
 
-**Daily scheduled entries.** A unit may carry entries `{at: 'HH:MM', power, mode?, temp?, fan?, days?}` with
+**Daily scheduled entries.** A unit may carry entries `{at: 'HH:MM', power, mode?, temp?, coolTo?, heatTo?, fan?, days?}` with
 `days` `all`, `weekday` or `weekend` (weekend covers holidays); `unitEntries` normalises them and drops malformed
 rows. `entryInstants` places them on the calendar; `entryInEffect`, `latestEntryAtOrBefore`, `nextEntry` and
 `eventEntry` answer the usual questions. The entry in
 effect at `peakStart` decides the season and the base setpoint of that morning's pre-conditioning
 (`entryEffFor`): an OFF entry means no pre-conditioning, an ON entry means pre-condition toward its mode.
+
+An ON entry may also **keep the mode** (name none) and carry a setpoint per season, `coolTo` and `heatTo`, in place
+of `temp` (with or without a mode). What such an entry means depends on the moment: the host supplies a *run
+context* `{mode, season, writeMode}` — the mode the unit will run and the mode the app may send with its power ON —
+and `resolveEntry(fields, rc)` turns the entry into concrete fields (`setpointFor` picks the season's setpoint). An
+entry that names a mode without the pair resolves to itself. `plan` takes the run context per unit as
+`opts.runContext`; without it a keep-mode entry is read in the unit's remembered mode.
 
 `plan(cfg, state, tz, date, opts)` assembles all of the above into one printable day: segments, events with
 per-unit texts ("heat +3° → 73° from 5:00"), entries and markers.

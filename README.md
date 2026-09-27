@@ -241,7 +241,11 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt?)` | the entry that sets an event's target, or null |
 | `armedAtOf(state, unitId)` | when the unit's schedule was last armed, or −∞ |
 | `entryEffFor(cfg, tz, unitCfg, unitState, liveMode, opts?)` | `(event) => eff`, per-event parameters for `activeEventFor` |
-| `plan(cfg, state, tz, date, opts?)` | one printable day: segments, events with per-unit texts, entries, markers |
+| `keepsMode(fields)`, `hasPair(fields)`, `resolves(fields)` | an On entry that keeps the mode (names none); one that carries `coolTo`/`heatTo`; either |
+| `setpointFor(fields, season)` | the setpoint an entry gives a season: `temp`, else `coolTo` (cooling) / `heatTo` (heating) |
+| `resolveEntry(fields, rc)` | the concrete `{power, mode?, temp?, fan?}` an entry means for a run context `{mode, season, writeMode}` (identity for an entry that names a mode without the pair) |
+| `entryResolution(fields, rc)` | `{season, mode?, temp?}`, the resolution as plans and activity lines show it |
+| `plan(cfg, state, tz, date, opts?)` | one printable day: segments, events with per-unit texts, entries, markers (`opts.runContext` resolves entries that keep the mode) |
 
 **tuning**: parameters, snapshots, the commit-time check
 

@@ -2,7 +2,9 @@
 // minLeadMin, tuned eff / earliestStart), D−1..D+1 scanning, tierAt, nextBoundaryAfter, plan()
 // (incl. H6 auto.params text), addendum B F2 (dryOutUntilFor, fan-only boundaries, PlanDay
 // fanOnlyUntil), the addendum §8 validate additions (guardrails, earliestStart), and the Release 4
-// entry helpers (unitEntries, entryInstants by day type, entryInEffect, eventEntry, nextEntry, eventOverlapping, …).
+// entry helpers (unitEntries, entryInstants by day type, entryInEffect, eventEntry, nextEntry, eventOverlapping, …) and Addendum F's
+// keep-mode / cool-to–heat-to entries (the pair's normalisation, the predicates and resolveEntry, entryPass's remembered
+// season, plan() with and without opts.runContext, explicit entries byte-identical).
 // Re-runs itself under TZ=UTC and TZ=Asia/Tokyo.
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -1164,4 +1166,137 @@ test('E plan: a weekday is unchanged by the option except events[].kind', () => 
   const on = tou.plan({ ...cfg, precondition: { ...cfg.precondition, superOffPeak: { weekend: true } } }, { units: {} }, tz, THU, { live })
   assert.deepEqual(on, off)
   assert.deepEqual(off.events.map((e) => e.kind), ['peak', 'peak'])
+})
+
+// ---- Addendum F: keep-mode entries and the cool-to / heat-to pair ----------------------------------------------
+
+const MON = '2026-09-28'
+const KEEP = { at: '07:00', power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' }
+const RC_HEAT = { masterMode: 'HEAT', mode: 'HEAT', season: 'heating', writeMode: 'HEAT', source: 'master' }
+
+test('F unitEntries / entryInstants: the pair normalised like temp and carried in fields; an Off row drops it', () => {
+  const { cfg, u } = withSched([
+    { at: '07:00', power: 'ON', coolTo: '74', heatTo: 68, fan: 'low' },
+    { at: '06:00', power: 'ON', mode: 'heat', heatTo: 70, coolTo: 76 },
+    { at: '12:00', power: 'ON', coolTo: 'x', heatTo: '' }, // malformed slots dropped (validation rejects them)
+    { at: '22:00', power: 'OFF', coolTo: 74 },
+  ])
+  assert.deepEqual(tou.unitEntries(u), [
+    { at: '06:00', min: 360, power: 'ON', mode: 'HEAT', coolTo: 76, heatTo: 70, days: 'all' },
+    { at: '07:00', min: 420, power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW', days: 'all' },
+    { at: '12:00', min: 720, power: 'ON', days: 'all' },
+    { at: '22:00', min: 1320, power: 'OFF', days: 'all' },
+  ])
+  assert.deepEqual(tou.entryInstants(cfg, tz, u, MON).map((x) => x.fields), [
+    { power: 'ON', mode: 'HEAT', coolTo: 76, heatTo: 70 },
+    { power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' },
+    { power: 'ON' },
+    { power: 'OFF' },
+  ])
+})
+
+test('F entry predicates and the one resolver (rule 1, rule 3, J28)', () => {
+  const keep = { power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' }
+  const rec = { power: 'ON', mode: 'HEAT', heatTo: 70, coolTo: 76 }
+  const explicit = { power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW' }
+  assert.deepEqual([keep, rec, explicit, { power: 'OFF' }, { power: 'ON' }].map((f) => [tou.keepsMode(f), tou.hasPair(f), tou.resolves(f)]),
+    [[true, true, true], [false, true, true], [false, false, false], [false, false, false], [true, false, true]])
+  assert.deepEqual([tou.setpointFor(keep, 'cooling'), tou.setpointFor(keep, 'heating'), tou.setpointFor(keep, null)], [74, 68, undefined])
+  assert.equal(tou.setpointFor({ power: 'ON', temp: 70 }, 'cooling'), 70, 'temp applies whatever the season')
+  assert.equal(tou.setpointFor({ power: 'ON', mode: 'HEAT', temp: 70 }, null), 70)
+  // identity for an Off entry and an entry without the pair that names a mode
+  const r0 = tou.resolveEntry(explicit, RC_HEAT)
+  assert.deepEqual(r0, explicit)
+  assert.notEqual(r0, explicit, 'a copy')
+  assert.deepEqual(tou.resolveEntry({ power: 'OFF' }, RC_HEAT), { power: 'OFF' })
+  // keep mode: the write mode and the season's setpoint of the run context
+  assert.deepEqual(tou.resolveEntry(keep, RC_HEAT), { power: 'ON', mode: 'HEAT', temp: 68, fan: 'LOW' })
+  assert.deepEqual(tou.resolveEntry(keep, { mode: 'COOL', season: 'cooling', writeMode: null }), { power: 'ON', temp: 74, fan: 'LOW' })
+  assert.deepEqual(tou.resolveEntry(keep, { mode: 'FAN', season: null, writeMode: null }), { power: 'ON', fan: 'LOW' })
+  assert.deepEqual(tou.resolveEntry({ power: 'ON' }, null), { power: 'ON' })
+  assert.deepEqual(tou.resolveEntry({ power: 'ON', temp: 70 }, { mode: 'COOL', season: 'cooling', writeMode: 'COOL' }), { power: 'ON', mode: 'COOL', temp: 70 })
+  assert.deepEqual(tou.resolveEntry({ power: 'ON', mode: 'DRY', coolTo: 74, heatTo: 68 }, RC_HEAT), { power: 'ON', mode: 'DRY', temp: 74 }, 'a DRY season resolves the cooling setpoint')
+  // explicit + pair: the named mode's season, whatever the context
+  assert.deepEqual(tou.resolveEntry(rec, { mode: 'COOL', season: 'cooling', writeMode: 'COOL' }), { power: 'ON', mode: 'HEAT', temp: 70 })
+  assert.deepEqual(tou.resolveEntry(rec, RC_HEAT), tou.resolveEntry(rec, RC_HEAT), 'deterministic')
+  // the EntryDTO / line view {season, mode?, temp?}
+  assert.deepEqual(tou.entryResolution(keep, RC_HEAT), { season: 'heating', mode: 'HEAT', temp: 68 })
+  assert.deepEqual(tou.entryResolution(keep, { mode: 'FAN', season: null, writeMode: null }), { season: null })
+  assert.deepEqual(tou.entryResolution(rec, null), { season: 'heating', mode: 'HEAT', temp: 70 })
+})
+
+test('F entryEffFor: a keep-mode E* takes its season from the remembered mode (stranded, then live) through the injected seasonOf', () => {
+  const { cfg, u } = withSched([KEEP])
+  const ev = tou.events(cfg, tz, MON)[0]
+  assert.equal(tou.entryEffFor(cfg, tz, u, null, 'COOL')(ev).season, 'cooling', 'the live mode')
+  assert.equal(tou.entryEffFor(cfg, tz, u, { stranded: { fields: { mode: 'HEAT' } } }, 'COOL')(ev).season, 'heating', 'the stranded mode first')
+  const seen = []
+  const master = (own) => { seen.push(own); return 'heating' } // decide injects C's seasonFor: a running master's season
+  assert.equal(tou.entryEffFor(cfg, tz, u, null, 'FAN', { seasonOf: master })(ev).season, 'heating')
+  assert.deepEqual(seen, ['FAN'])
+  const eff = tou.entryEffFor(cfg, tz, u, null, 'FAN')(ev)
+  assert.deepEqual([eff.season, eff.suspended, eff.leadMin], ['heating', false, 120], "season unknown ⇒ the 'heating' window; an ON E never suspended")
+  // an explicit E*: its mode, as before
+  const ex = withSched([{ at: '07:00', power: 'ON', mode: 'COOL', temp: 74 }])
+  assert.equal(tou.entryEffFor(ex.cfg, tz, ex.u, { stranded: { fields: { mode: 'HEAT' } } }, 'HEAT')(ev).season, 'cooling')
+})
+
+test('F plan with opts.runContext: precondition / entry / restore / entries texts of a keep-mode entry (§3.4)', () => {
+  const { cfg } = withSched([KEEP, { at: '22:00', power: 'OFF' }], 'office')
+  const st = { units: {}, ledger: {} }
+  const rc = (x) => ({ office: () => x })
+  const off = { office: { power: 'OFF', mode: 'FAN', temp: 68, fan: 'LOW' } }
+  const p = tou.plan(cfg, st, tz, MON, { live: off, runContext: rc(RC_HEAT) })
+  const o = p.events[0].units.office
+  assert.equal(o.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
+  assert.deepEqual([o.preStart, o.target], [ISOL(MON, '05:00'), 71])
+  assert.deepEqual(o.entry, { key: `s:${MON}@07:00`, at: ISOL(MON, '07:00'), atLabel: '7:00', label: 'On · heat to 68° · Low', resolved: { season: 'heating', mode: 'HEAT', temp: 68 } })
+  assert.equal(o.restore, 'Heat 68° · Low')
+  assert.equal(o.fanOnlyUntil, ISOL(MON, '07:15'), 'the unit the entry turns on runs the resolved mode')
+  const e0 = p.entries.office[0]
+  assert.deepEqual([e0.label, e0.resolved, e0.fields], ['On · heat to 68° · Low', { season: 'heating', mode: 'HEAT', temp: 68 }, { power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' }])
+  assert.equal(p.entries.office[1].resolved, undefined, 'an Off entry has no resolution')
+  assert.equal(p.markers.find((m) => m.kind === 'folded').lines[0].label, 'On · heat to 68° · Low')
+  // running in Cool of its own (rc from the read): already conditioned toward cool to 74°
+  const coolRc = { masterMode: 'COOL', mode: 'COOL', season: 'cooling', writeMode: null, source: 'live' }
+  const keeps = tou.plan(cfg, st, tz, MON, { live: { office: { power: 'ON', mode: 'COOL', temp: 68 } }, runContext: rc(coolRc) }).events[0].units.office
+  assert.deepEqual([keeps.precondition, keeps.target, keeps.restore], ['keeps 68° (already below the 71° target)', null, 'keep mode · 74° · Low'])
+  // season unknown: no pre-condition
+  const unk = tou.plan(cfg, st, tz, MON, { live: off, runContext: rc({ masterMode: null, mode: 'FAN', season: null, writeMode: null, source: 'remembered' }) })
+  assert.equal(unk.events[0].units.office.precondition, 'skip: season unknown')
+  assert.deepEqual([unk.entries.office[0].label, unk.entries.office[0].resolved], ['On · cool to 74° / heat to 68° · Low', { season: null }])
+  // without opts.runContext: the remembered mode (stranded, then the read), never a written mode
+  const fb = tou.plan(cfg, st, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
+  assert.equal(fb.events[0].units.office.precondition, 'cool −3° → 71° from 5:00 (scheduled cool to 74°)')
+  assert.deepEqual(fb.entries.office[0].resolved, { season: 'cooling', temp: 74 })
+  const fbS = tou.plan(cfg, { units: { office: { stranded: { fields: { mode: 'HEAT' } } } }, ledger: {} }, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
+  assert.equal(fbS.events[0].units.office.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
+  // engaged: auto.entry's season / resolved, the owned bump from the pair's base
+  const eng = { units: { office: { auto: { phase: 'precondition', eventId: `${MON}@07:00`, params: { season: 'heating', deltaF: 3, leadMin: 120, source: 'config' },
+    entry: { key: `s:${MON}@07:00`, at: ISOL(MON, '07:00'), fields: { power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' }, season: 'heating', resolved: { power: 'ON', mode: 'HEAT', temp: 68, fan: 'LOW' } },
+    owned: { power: { original: 'OFF', applied: 'ON', status: 'held' }, temp: { original: 68, applied: 71, status: 'held' } }, baseline: { power: 'OFF', mode: 'FAN', temp: 68 } } } } }
+  const pe = tou.plan(cfg, eng, tz, MON, { live: { office: { power: 'ON', mode: 'HEAT', temp: 71 } } }).events[0].units.office
+  assert.equal(pe.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
+  assert.deepEqual([pe.entry.label, pe.entry.resolved, pe.restore], ['On · heat to 68° · Low', { season: 'heating', mode: 'HEAT', temp: 68 }, 'Heat 68° · Low'])
+})
+
+test('F plan: an explicit entry with the pair (the named season), and explicit entries byte-identical with or without opts.runContext (J30)', () => {
+  const rec = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', heatTo: 70, coolTo: 76 }])
+  const live = { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }
+  const coolRc = { kitchen: () => ({ masterMode: 'COOL', mode: 'COOL', season: 'cooling', writeMode: 'COOL' }) }
+  const k = tou.plan(rec.cfg, { units: {} }, tz, MON, { live, runContext: coolRc })
+  const ku = k.events[0].units.kitchen
+  assert.deepEqual([ku.precondition, ku.entry.label, ku.entry.resolved, ku.restore],
+    ['heat +3° → 73° from 5:00 (scheduled Heat 70°)', 'On · Heat 70°', { season: 'heating', mode: 'HEAT', temp: 70 }, 'Heat 70°'])
+  assert.equal(k.entries.kitchen[0].label, 'On · Heat 70°')
+  // J30: the run context is never read for an entry without the pair that names a mode
+  const { cfg } = withSched(KITCHEN_SCHED)
+  cfg.precondition.optimumStart = 60
+  const throws = () => { throw new Error('read') }
+  for (const [date, lv] of [[THU, { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } }], [SAT, {}], [THU, { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }]]) {
+    const a = tou.plan(cfg, { units: {}, ledger: {} }, tz, date, { live: lv })
+    const b = tou.plan(cfg, { units: {}, ledger: {} }, tz, date, { live: lv, runContext: { kitchen: throws, office: throws, 'living-room': throws } })
+    assert.equal(JSON.stringify(b), JSON.stringify(a), date)
+    assert.ok(!JSON.stringify(a).includes('resolved'))
+  }
 })
