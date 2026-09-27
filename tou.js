@@ -1,0 +1,846 @@
+// tou.js — time-of-use tables → tiers, peak events, precondition windows, plan (spec §5.2,
+// §9.4; addendum H6). PURE: no I/O, no clock; `now` is always passed in (epoch ms) and all
+// wall-clock math goes through the injected `tz` (tz.js makeTz()).
+//
+// Units of the returned values:
+//   segments/events/preconditionWindow/tierAt/activeEventFor/nextBoundaryAfter/dryOutUntilFor → epoch MS numbers
+//   plan() is an API DTO (§4.4) → ISO-8601 UTC strings plus local 'HH:MM' labels.
+//   firstPreconditionDate → local 'YYYY-MM-DD' | null (the first morning a tuning change can affect).
+//
+// Event model: an event is a maximal run of `peak` windows of one local date; windows that touch or
+// are separated by a gap < tou.mergeGapMin merge (the gap becomes part of the event). kind 'peak'.
+//   id = '<date>@<HH:MM of the first window start as configured>' (stable across DST/restarts).
+//   Windows never cross midnight (validation), so events of different dates never merge.
+// Boundary events (addendum E E1.2/E1.3): while cfg.precondition.superOffPeak.weekend === true, every date whose
+//   dayType is not 'weekday' also has one event per super off-peak → off-peak transition of its segments
+//   (validate.offPeakBoundaries; a transition at local 00:00 never counts): {id: '<date>@<HH:MM>', date,
+//   kind:'boundary', peakStart = peakEnd = t, precondition: true, windows: []}, sorted with the peak events by
+//   peakStart. The peak is EMPTY: activeEventFor yields 'precondition' on [preStart, t) and nothing from t (never
+//   'shed'); a boundary is a previous event for the date's later events (preconditionWindow's prev clamp) and vice
+//   versa; dryOutUntilFor is null; eventEntry admits the entry AT t (E1.6); entryPass (entryEffFor) gives a unit
+//   without an ON entry E that does not read ON in a precondition mode (OFF, or ON in Fan/Auto) no window (E1.8,
+//   J23, noPrecondition); eventOverlapping ignores an empty window.
+//   With the option off events() is Release 4's (J25), each peak event now carrying kind 'peak'.
+//
+// Precondition window (§5.2 + H6):
+//   preStart = max(peakStart − leadMin, previous same-day event end + mergeGapMin, 03:00 local,
+//                  optimizer.earliestStart when the LEAD is tuned: (eff.leadSource ?? eff.source) === 'tuned',
+//                  addendum D X1.1 — a tuned Δ alone never moves the base start; frozen params written before
+//                  the upgrade carry only `source` and keep their window)
+//   leadMin = eff?.leadMin ?? cfg.precondition.leadMin[season]; season null/unknown ⇒ 'heating'.
+//   None when the event is not precondition-flagged, eff.suspended, or peakStart − preStart < minLeadMin.
+//
+// Fan-only dry-out (addendum B F2): a shed entered from a running unit first runs mode FAN until
+//   dryOutUntil = min(entry read + shed.fanOnlyMin[season], peakEnd) (dryOutUntilFor; season from the
+//   mode, AUTO/FAN ⇒ none; missing config ⇒ the shipped 60 cooling / 15 heating; peakEnd ≤ from ⇒ none — a
+//   boundary event, addendum E E1.4), then turns OFF.
+//   nextBoundaryAfter wakes at peakStart + fanOnlyMin for both seasons; PlanDay units carry fanOnlyUntil.
+//
+// Effective params (H6): tou does not import tuning.js (it would create an import cycle with
+// tuning.gateOpen → activeEventFor), nor a host's multi-split / optimum-start modules (they import tou). plan() accepts
+// `opts.effectivePrecondition` (inject tuning.effectivePrecondition); without it a faithful copy of
+// addendum §5.2 is used.
+//
+// Day types (addendum D E1): dayType(cfg, date) delegates to validate.dayTypeOf — one partition.
+//
+// Daily scheduled settings (addendum B F3 + D E1/E2; times are epoch ms unless noted):
+//   unitEntries(unitCfg) → [{at:'HH:MM', min, power:'ON'|'OFF', mode?, temp?, fan?, days}] normalised (upper-case
+//     enums, booleans → ON/OFF, numeric temp; an Off entry carries nothing else), malformed rows dropped,
+//     sorted by time then all < weekday < weekend.
+//   entryInstants(cfg, tz, unitCfg, date) → [{key:'s:<date>@<HH:MM>', at, date, hhmm, days, fields:{power,
+//     mode?, temp?, fan?}}] — THE one place entries meet the calendar: an entry is dropped when its `days`
+//     does not match the date's day type (entryOnDay); instants via zonedToInstant (DST like TOU windows);
+//     of two rows that still collide on one key the first is kept.
+//   latestEntryAtOrBefore(cfg, tz, unitCfg, instant, armedAt = −∞) → the latest instant ≤ `instant` over its
+//     local date and D−1 with at > armedAt | null (B F3.11's E*, D's P). entryInEffect(cfg, tz, unitCfg, now,
+//     armedAt) is the same rule at `now` (B F3.3/F3.4). armedAt: epoch ms or ISO.
+//   nextEntry(cfg, tz, unitCfg, now, armedAt = −∞) → the earliest instant > now within 24 h (D, D+1), at > armedAt.
+//   eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt = −∞) → the latest instant with preStart ≤ t ≤
+//     max(peakStart, now) ∧ (t < peakEnd ∨ t = peakStart) ∧ t > armedAt | null (B F3.12: the precondition target at
+//     now ≤ peakStart, the folded entry after; F3.4: an entry the arming passed is never the event's, so no restore
+//     applies it; E E1.6: t = peakStart admits a boundary event's entry at its instant).
+//   eventOverlapping(cfg, tz, unitCfg, from, to, eff?) → true when a participating event of the unit (D−1..D+1
+//     of `to`; shed:false never participates; released/skipped make no difference) has preStart ≤ to ∧
+//     peakEnd > from ∧ preStart < peakEnd (D E2.5, the optimum-start interval test; the last term only ever drops a
+//     boundary event the unit does not pre-condition for, addendum E E1.10).
+//   foldEventFor(cfg, tz, unitCfg, at, eff?) → the participating event whose [preStart, peakEnd) contains an
+//     entry instant | null (B §1.7 step 2's fold decision = activeEventFor at E.at; PlanDay entries[].folded).
+//   entryEffFor(cfg, tz, unitCfg, unitState, liveMode, {effectivePrecondition?, seasonOf?, armedAt?, livePower?}) →
+//     (event) → eff — B §1.3 effFor with F3.11's two passes: while engaged with the event the frozen auto.params (H5);
+//     else E* = latestEntryAtOrBefore(peakStart, armedAt), season = seasonOf(E*.power ON ? E*.mode : liveMode) (the host
+//     injects its multi-split season rule through `seasonOf`), eff = effectivePrecondition(season ?? 'heating'); E = E* iff E*.at ≥
+//     that window's preStart — then noPrecondition when E says OFF, suspended:false when E says ON (C-11); an E*
+//     before preStart already fired: live rules. Addendum E E1.8/J23: for a BOUNDARY event, noPrecondition too when E
+//     is not an ON entry and the unit does not read ON in a precondition mode (livePower 'ON' and liveMode Heat, Cool
+//     or Dry; unknown counts as not) — only units with something to do engage.
+//   armedAtOf(state, unitId) → max(state.scheduleArmedAt, units[id].scheduleEditedAt) in ms | −∞ (B F3.4).
+//   activeEventFor's `eff` may be such a function (event) → eff; eff.noPrecondition ⇒ preStart = peakStart.
+
+import { isHoliday } from './holidays.js'
+import { dayTypeOf, entryOnDay, ENTRY_DAYS, offPeakBoundaries } from './validate.js'
+import { entryLabel, modeLabel, settingLabel } from './labels.js'
+import { addDays, dowOf, hhmmToMin, minToHHMM } from './tz.js'
+import { clamp, roundToStep } from './util.js'
+
+export const TIERS = ['peak', 'off_peak', 'super_off_peak']
+const MIN_MS = 60000
+const MINUS = '−'
+const FAN_ONLY_MIN = { cooling: 60, heating: 15 } // shipped shed.fanOnlyMin (store.defaultConfig)
+
+function pick(v, season) {
+  if (v == null) return undefined
+  if (typeof v === 'number') return v
+  return v[season]
+}
+
+function iso(ms) { return ms == null ? null : new Date(ms).toISOString() }
+function msOf(v) {
+  const t = typeof v === 'number' ? v : typeof v === 'string' ? Date.parse(v) : NaN
+  return Number.isFinite(t) ? t : null
+}
+
+/** 'weekday' | 'weekend' | 'holiday' (holiday = date listed in holidays.rows) — validate.dayTypeOf. */
+export function dayType(cfg, date) {
+  return dayTypeOf({ weekendDays: cfg?.tou?.weekendDays, holidayDates: { has: (d) => !!isHoliday(cfg?.holidays, d) } }, date)
+}
+
+function tableFor(cfg, date) {
+  const t = dayType(cfg, date) === 'weekday' ? cfg?.tou?.weekday : cfg?.tou?.weekendHoliday
+  return Array.isArray(t) ? t : []
+}
+
+// Gap-filled, unmerged minute segments of one local date: [{tier, startMin, endMin, precondition}].
+function rawSegments(cfg, date) {
+  const rows = []
+  for (const w of tableFor(cfg, date)) {
+    let startMin, endMin
+    try { startMin = hhmmToMin(w.start); endMin = hhmmToMin(w.end) } catch { continue } // validation rejects these
+    if (endMin > startMin) rows.push({ tier: w.tier, startMin, endMin, precondition: w.tier === 'peak' && !!w.precondition })
+  }
+  rows.sort((a, b) => a.startMin - b.startMin)
+  const def = cfg?.tou?.defaultTier ?? 'super_off_peak'
+  const out = []
+  let cur = 0
+  for (const w of rows) {
+    const s = Math.max(w.startMin, cur) // overlapping rows are clipped (validation rejects overlaps)
+    if (s >= w.endMin) continue
+    if (s > cur) out.push({ tier: def, startMin: cur, endMin: s, precondition: false })
+    out.push({ ...w, startMin: s })
+    cur = w.endMin
+  }
+  if (cur < 1440) out.push({ tier: def, startMin: cur, endMin: 1440, precondition: false })
+  return out
+}
+
+// Raw segments with instants; boundaries forced monotonic (a DST-gap boundary maps forward and may
+// collapse a segment to zero length — those are dropped).
+function timedSegments(cfg, tz, date) {
+  const out = []
+  let prev = -Infinity
+  for (const r of rawSegments(cfg, date)) {
+    const start = Math.max(tz.zonedToInstant(date, r.startMin), prev)
+    const end = Math.max(tz.zonedToInstant(date, r.endMin), start)
+    prev = end
+    if (end > start) out.push({ ...r, start, end, localStart: minToHHMM(r.startMin), localEnd: minToHHMM(r.endMin) })
+  }
+  return out
+}
+
+/** Gap-filled tier segments of one local date, adjacent same-tier segments merged. */
+export function segments(cfg, tz, date) {
+  const out = []
+  for (const s of timedSegments(cfg, tz, date)) {
+    const last = out[out.length - 1]
+    if (last && last.tier === s.tier && last.end === s.start) {
+      last.end = s.end
+      last.localEnd = s.localEnd
+      continue
+    }
+    out.push({ tier: s.tier, start: s.start, end: s.end, localStart: s.localStart, localEnd: s.localEnd })
+  }
+  return out
+}
+
+/**
+ * Events of one local date, by peakStart: merged peak events {id, date, kind:'peak', peakStart, peakEnd,
+ * precondition, windows} and, with the weekend pre-condition on, boundary events (see header).
+ */
+export function events(cfg, tz, date) {
+  const gapMs = Math.max(0, Number(cfg?.tou?.mergeGapMin ?? 30)) * MIN_MS
+  const segs = timedSegments(cfg, tz, date)
+  const out = []
+  let cur = null
+  for (const s of segs) {
+    if (s.tier !== 'peak') continue
+    const win = { start: s.start, end: s.end, localStart: s.localStart, localEnd: s.localEnd, precondition: s.precondition }
+    if (cur && (s.start <= cur.peakEnd || s.start - cur.peakEnd < gapMs)) {
+      cur.peakEnd = Math.max(cur.peakEnd, s.end)
+      cur.precondition = cur.precondition || s.precondition
+      cur.windows.push(win)
+      continue
+    }
+    cur = { id: `${date}@${s.localStart}`, date, kind: 'peak', peakStart: s.start, peakEnd: s.end, precondition: s.precondition, windows: [win] }
+    out.push(cur)
+  }
+  if (cfg?.precondition?.superOffPeak?.weekend !== true || dayType(cfg, date) === 'weekday') return out
+  for (const t of offPeakBoundaries(segs)) {
+    const s = segs.find((x) => x.start === t)
+    out.push({ id: `${date}@${s.localStart}`, date, kind: 'boundary', peakStart: t, peakEnd: t, precondition: true, windows: [] })
+  }
+  return out.sort((a, b) => a.peakStart - b.peakStart)
+}
+
+/**
+ * First local date ≥ fromDate (scanning `maxDays` dates) that has a precondition-flagged event, else
+ * null — the first morning a tuning change applied from `fromDate` can affect (weekends and holidays
+ * of the default tables have none).
+ */
+export function firstPreconditionDate(cfg, tz, fromDate, maxDays = 8) {
+  let d = fromDate
+  for (let i = 0; i < maxDays; i++, d = addDays(d, 1)) {
+    if (events(cfg, tz, d).some((e) => e.precondition)) return d
+  }
+  return null
+}
+
+/**
+ * Precondition window of `event` for a unit in `season` ('heating'|'cooling'|null), optionally with
+ * effective params `eff` ({leadMin, source, suspended, ...} from tuning.effectivePrecondition or the
+ * frozen auto.params). → {preStart, peakStart, leadMin, season} | null
+ */
+export function preconditionWindow(cfg, tz, event, season, eff) {
+  if (!event || !event.precondition) return null
+  if (eff?.suspended) return null
+  const s = season === 'cooling' ? 'cooling' : 'heating'
+  const date = event.date ?? String(event.id).split('@')[0]
+  const pc = cfg?.precondition ?? {}
+  let leadMin = Number(eff?.leadMin ?? pick(pc.leadMin, s) ?? 120)
+  if (!Number.isFinite(leadMin)) leadMin = 120
+  const peakStart = event.peakStart
+  let preStart = peakStart - leadMin * MIN_MS
+  const gapMs = Math.max(0, Number(cfg?.tou?.mergeGapMin ?? 30)) * MIN_MS
+  let prev = null
+  for (const e of events(cfg, tz, date)) if (e.id !== event.id && e.peakEnd <= peakStart) prev = e
+  if (prev) preStart = Math.max(preStart, prev.peakEnd + gapMs)
+  preStart = Math.max(preStart, tz.zonedToInstant(date, '03:00'))
+  if ((eff?.leadSource ?? eff?.source) === 'tuned') {
+    // eff.earliestStart (present on tuning.effectivePrecondition output, and on auto.params when the
+    // engine snapshots it) wins over the live config, so a frozen ownership keeps its window.
+    let earliest
+    try { earliest = tz.zonedToInstant(date, eff.earliestStart ?? cfg?.optimizer?.earliestStart ?? '04:30') } catch { earliest = tz.zonedToInstant(date, '04:30') }
+    preStart = Math.max(preStart, earliest)
+  }
+  const minLead = Number(pc.minLeadMin ?? 20)
+  if (peakStart - preStart < minLead * MIN_MS) return null
+  return { preStart, peakStart, leadMin: Math.round((peakStart - preStart) / MIN_MS), season: s }
+}
+
+/**
+ * Fan-only dry-out deadline (addendum B F2.5): min(from + shed.fanOnlyMin[season] minutes, event.peakEnd)
+ * in epoch ms, or null when `season` ('cooling'|'heating') has none — season null (AUTO/FAN) or
+ * fanOnlyMin 0. `from` defaults to peakStart (the plan); the host passes the fresh read that enters shed.
+ */
+export function dryOutUntilFor(cfg, event, season, from = event?.peakStart) {
+  if (!event || event.peakEnd <= from) return null // a boundary event (addendum E E1.4): no shed, no dry-out
+  if (season !== 'cooling' && season !== 'heating') return null
+  const min = Number(pick(cfg?.shed?.fanOnlyMin, season) ?? FAN_ONLY_MIN[season])
+  if (!Number.isFinite(min) || min <= 0 || !Number.isFinite(from)) return null
+  return Math.min(from + min * MIN_MS, event.peakEnd)
+}
+
+/** Current tier with its full contiguous extent (extends across midnight): {kind, since, until}. */
+export function tierAt(cfg, tz, now) {
+  const date = tz.localParts(now).date
+  let list = segments(cfg, tz, date)
+  let idx = list.findIndex((s) => now >= s.start && now < s.end)
+  if (idx < 0) return { kind: cfg?.tou?.defaultTier ?? 'super_off_peak', since: now, until: now + MIN_MS }
+  const kind = list[idx].tier
+  let since = list[idx].start
+  let until = list[idx].end
+  let d = date
+  let i = idx
+  for (let guard = 0; i === 0 && guard < 8; guard++) {
+    d = addDays(d, -1)
+    const prev = segments(cfg, tz, d)
+    const last = prev[prev.length - 1]
+    if (!last || last.tier !== kind || last.end !== since) break
+    since = last.start
+    i = prev.length - 1
+  }
+  d = date
+  i = idx
+  for (let guard = 0; i === list.length - 1 && guard < 8; guard++) {
+    d = addDays(d, 1)
+    const next = segments(cfg, tz, d)
+    const first = next[0]
+    if (!first || first.tier !== kind || first.start !== until) break
+    until = first.end
+    list = next
+    i = 0
+  }
+  return { kind, since, until }
+}
+
+/**
+ * Next instant > now at which the schedule can change: tier boundaries, peak start/end, base
+ * precondition starts and fan-only deadlines peakStart + fanOnlyMin (both seasons, addendum B F2), every
+ * unit's daily-schedule entry instants (addendum B §5.2) and local midnights. Tuned per-unit precondition
+ * starts, late-join deadlines and optimum starts are not included (a host re-ticks at least every 30 s and
+ * predicts early starts itself).
+ */
+export function nextBoundaryAfter(cfg, tz, now) {
+  const date = tz.localParts(now).date
+  for (const d of [date, addDays(date, 1), addDays(date, 2)]) {
+    let best = Infinity
+    const consider = (t) => { if (t > now && t < best) best = t }
+    consider(tz.zonedToInstant(d, '00:00'))
+    consider(tz.zonedToInstant(addDays(d, 1), '00:00'))
+    for (const s of segments(cfg, tz, d)) { consider(s.start); consider(s.end) }
+    for (const e of events(cfg, tz, d)) {
+      consider(e.peakStart)
+      consider(e.peakEnd)
+      for (const season of ['heating', 'cooling']) {
+        const w = preconditionWindow(cfg, tz, e, season)
+        if (w) consider(w.preStart)
+        const dry = dryOutUntilFor(cfg, e, season)
+        if (dry != null) consider(dry)
+      }
+    }
+    for (const u of Array.isArray(cfg?.units) ? cfg.units : []) for (const x of entryInstants(cfg, tz, u, d)) consider(x.at)
+    if (best < Infinity) return best
+  }
+  return now + 86400000
+}
+
+/**
+ * The event a unit is in at `now` (scans local D−1, D, D+1):
+ * {event, phase:'precondition'|'shed', preStart} | null. `unitCfg` null ⇒ whole-system level (all flags on);
+ * missing unit flags default to true. `eff` supplies season/leadMin/suspended (H5/H6); without it the
+ * heating base lead is used.
+ */
+export function activeEventFor(cfg, tz, unitCfg, now, eff) {
+  if (unitCfg && unitCfg.shed === false) return null
+  const date = tz.localParts(now).date
+  for (const d of [addDays(date, -1), date, addDays(date, 1)]) {
+    for (const e of events(cfg, tz, d)) {
+      if (now >= e.peakEnd) continue
+      const preStart = preStartOf(cfg, tz, unitCfg, e, eff)
+      if (now >= preStart) return { event: e, phase: now < e.peakStart ? 'precondition' : 'shed', preStart }
+    }
+  }
+  return null
+}
+
+// The unit's window start for `e`: the precondition window's start when the unit and the event pre-condition
+// and the (per-event) eff allows it, else peakStart. `eff` may be a function (event) → eff (B §1.3).
+function preStartOf(cfg, tz, unitCfg, e, eff) {
+  const ef = typeof eff === 'function' ? eff(e) : eff
+  if (unitCfg && unitCfg.precondition === false) return e.peakStart
+  if (!e.precondition || ef?.noPrecondition) return e.peakStart
+  const w = preconditionWindow(cfg, tz, e, ef?.season ?? null, ef)
+  return w ? w.preStart : e.peakStart
+}
+
+/** D E2.5 interval test (see header). */
+export function eventOverlapping(cfg, tz, unitCfg, from, to, eff) {
+  if (unitCfg && unitCfg.shed === false) return false
+  const date = tz.localParts(to).date
+  for (const d of [addDays(date, -1), date, addDays(date, 1)]) {
+    for (const e of events(cfg, tz, d)) {
+      if (e.peakEnd <= from) continue
+      const pre = preStartOf(cfg, tz, unitCfg, e, eff)
+      if (pre <= to && pre < e.peakEnd) return true
+    }
+  }
+  return false
+}
+
+/** B §1.7 step 2: the participating event an entry instant folds into (see header). */
+export function foldEventFor(cfg, tz, unitCfg, at, eff) {
+  return activeEventFor(cfg, tz, unitCfg, at, eff)?.event ?? null
+}
+
+// ---- daily scheduled settings (addendum B F3, D E1) ----------------------------------------------
+
+const DAYS_RANK = Object.fromEntries(ENTRY_DAYS.map((d, i) => [d, i]))
+
+/** Normalised, sorted entries of a unit (see header). */
+export function unitEntries(unitCfg) {
+  const list = Array.isArray(unitCfg?.schedule) ? unitCfg.schedule : []
+  const out = []
+  for (const x of list) {
+    if (!x || typeof x !== 'object') continue
+    let min
+    try { min = hhmmToMin(x.at) } catch { continue }
+    if (min >= 1440 || !/^\d{2}:\d{2}$/.test(x.at)) continue
+    const power = typeof x.power === 'boolean' ? (x.power ? 'ON' : 'OFF') : String(x.power ?? '').toUpperCase()
+    if (power !== 'ON' && power !== 'OFF') continue
+    const e = { at: x.at, min, power }
+    if (power === 'ON') {
+      if (x.mode != null && x.mode !== '') e.mode = String(x.mode).toUpperCase()
+      if (x.temp != null && x.temp !== '' && Number.isFinite(Number(x.temp))) e.temp = Number(x.temp)
+      if (x.fan != null && x.fan !== '') e.fan = String(x.fan).toUpperCase()
+    }
+    e.days = x.days ?? 'all'
+    out.push(e)
+  }
+  return out.sort((a, b) => a.min - b.min || (DAYS_RANK[a.days] ?? 9) - (DAYS_RANK[b.days] ?? 9))
+}
+
+function entryFields(e) {
+  const f = { power: e.power }
+  for (const k of ['mode', 'temp', 'fan']) if (e[k] !== undefined) f[k] = e[k]
+  return f
+}
+
+/** Entry instants of one local date, filtered by day type (see header). */
+export function entryInstants(cfg, tz, unitCfg, date) {
+  const dt = dayType(cfg, date)
+  const seen = new Set()
+  const out = []
+  for (const e of unitEntries(unitCfg)) {
+    if (!entryOnDay(e.days, dt)) continue
+    const key = `s:${date}@${e.at}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ key, at: tz.zonedToInstant(date, e.min), date, hhmm: e.at, days: e.days, fields: entryFields(e) })
+  }
+  return out.sort((a, b) => a.at - b.at)
+}
+
+function armedMs(armedAt) {
+  if (armedAt == null) return -Infinity
+  const t = msOf(armedAt)
+  return t == null ? -Infinity : t
+}
+
+/** B F3.11 E* / D P: the latest instant ≤ `instant` over its date and D−1 (see header). */
+export function latestEntryAtOrBefore(cfg, tz, unitCfg, instant, armedAt) {
+  const armed = armedMs(armedAt)
+  const date = tz.localParts(instant).date
+  let best = null
+  for (const d of [addDays(date, -1), date]) {
+    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at <= instant && x.at > armed && (!best || x.at >= best.at)) best = x
+  }
+  return best
+}
+
+/** B F3.3/F3.4: the entry in effect at `now` (see header). */
+export function entryInEffect(cfg, tz, unitCfg, now, armedAt) {
+  return latestEntryAtOrBefore(cfg, tz, unitCfg, now, armedAt)
+}
+
+/** D E2.11: the next entry instant after `now` within 24 h (see header). */
+export function nextEntry(cfg, tz, unitCfg, now, armedAt) {
+  const armed = armedMs(armedAt)
+  const date = tz.localParts(now).date
+  for (const d of [date, addDays(date, 1)]) {
+    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at > now && x.at > armed && x.at <= now + 86400000) return x
+  }
+  return null
+}
+
+/** B F3.12 + E E1.6: the latest entry with preStart ≤ t ≤ max(peakStart, now) ∧ (t < peakEnd ∨ t = peakStart) ∧ t > armedAt (see header). */
+export function eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt) {
+  if (!event) return null
+  const armed = armedMs(armedAt)
+  const hi = Math.max(event.peakStart, Number.isFinite(now) ? now : -Infinity)
+  const date = event.date ?? String(event.id).split('@')[0]
+  let best = null
+  for (const d of [addDays(date, -1), date]) {
+    for (const x of entryInstants(cfg, tz, unitCfg, d)) if (x.at >= preStart && x.at <= hi && (x.at < event.peakEnd || x.at === event.peakStart) && x.at > armed && (!best || x.at >= best.at)) best = x
+  }
+  return best
+}
+
+/** B F3.4 arming instant of a unit (see header). */
+export function armedAtOf(state, unitId) {
+  const a = msOf(state?.scheduleArmedAt)
+  const b = msOf(state?.units?.[unitId]?.scheduleEditedAt)
+  return Math.max(a ?? -Infinity, b ?? -Infinity)
+}
+
+// B F3.11's two passes for one unit and event (not engaged): (1) E* = the latest entry at or before peakStart and
+// after armedAt (F3.4: an entry the arming passed is no entry today);
+// (2) season = seasonOf(E*.power ON ? E*.mode : liveMode), the window from that season's params (a suspension
+// ignored for the test), E = E* iff E*.at ≥ preStart (else it already fired: live rules). eff carries
+// noPrecondition for an OFF E and suspended:false for an ON E (C-11); for a boundary event also when E is not an
+// ON entry and the unit does not read ON in a precondition mode — its own mode's season, Fan/Auto/unknown have none
+// (addendum E E1.8, J23). → {star, E, season, eff}
+function entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, livePower) {
+  const r = entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt)
+  const onLive = String(livePower ?? '').toUpperCase() === 'ON' && seasonOfMode(liveMode) != null
+  if (e.kind === 'boundary' && r.E?.fields.power !== 'ON' && !onLive) r.eff = { ...r.eff, noPrecondition: true }
+  return r
+}
+
+function entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt) {
+  const star = latestEntryAtOrBefore(cfg, tz, unitCfg, e.peakStart, armedAt)
+  const on = star?.fields.power === 'ON'
+  const season = seasonFn(on ? star.fields.mode : liveMode) ?? null
+  const eff = effFn(cfg, unitCfg, unitState, season ?? 'heating')
+  if (!star) return { star, E: null, season, eff }
+  const pre = preStartOf(cfg, tz, unitCfg, e, { ...eff, season, suspended: false })
+  const E = star.at >= pre ? star : null
+  if (!E) return { star, E, season, eff }
+  return { star, E, season, eff: on ? { ...eff, suspended: false } : { ...eff, noPrecondition: true } }
+}
+
+/** B §1.3 effFor for one unit (see header). */
+export function entryEffFor(cfg, tz, unitCfg, unitState, liveMode, { effectivePrecondition, seasonOf, armedAt, livePower } = {}) {
+  const effFn = typeof effectivePrecondition === 'function' ? effectivePrecondition : fallbackEff
+  const seasonFn = typeof seasonOf === 'function' ? seasonOf : seasonOfMode
+  const auto = unitState?.auto
+  return (e) => {
+    if (auto && auto.phase && auto.phase !== 'idle' && auto.eventId === e.id && auto.params) return auto.params
+    return entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, livePower).eff
+  }
+}
+
+// ---- plan (PlanDay DTO, §4.4 + H6) ------------------------------------------------------------
+
+function seasonOfMode(mode) {
+  const m = String(mode ?? '').toUpperCase()
+  if (m === 'HEAT') return 'heating'
+  if (m === 'COOL' || m === 'DRY') return 'cooling'
+  return null
+}
+
+// Faithful copy of addendum §5.2 effectivePrecondition (used when tuning.js is not injected): per-parameter
+// provenance and read-time clamps of the TUNED parameter only, as tuning.js (addendum D X1.1, A-11).
+function fallbackEff(cfg, unitCfg, unitState, season) {
+  const s = season === 'cooling' ? 'cooling' : 'heating'
+  const pc = cfg?.precondition ?? {}
+  const opt = cfg?.optimizer ?? {}
+  const tuned = unitState?.tuning?.[s]
+  const deltaSource = typeof tuned?.deltaF === 'number' ? 'tuned' : 'config'
+  const leadSource = typeof tuned?.leadMin === 'number' ? 'tuned' : 'config'
+  let deltaF = deltaSource === 'tuned' ? tuned.deltaF : pick(pc.deltaF, s) ?? 3
+  let leadMin = leadSource === 'tuned' ? tuned.leadMin : pick(pc.leadMin, s) ?? 120
+  const source = deltaSource === 'tuned' || leadSource === 'tuned' ? 'tuned' : 'config'
+  let clampedBy = null
+  if (deltaSource === 'tuned') {
+    const lo = opt.minDeltaF ?? 1
+    const hi = Math.min(opt.maxDeltaF ?? 4, 6)
+    if (deltaF > hi) { deltaF = hi; clampedBy = 'maxDeltaF' } else if (deltaF < lo) { deltaF = lo; clampedBy = 'minDeltaF' }
+  }
+  if (leadSource === 'tuned') leadMin = clamp(leadMin, opt.minLeadMin ?? 60, 240)
+  return {
+    season, deltaF, leadMin,
+    clampF: pc.clampF ?? { coolingMin: 65, heatingMax: 76 },
+    earliestStart: opt.earliestStart ?? '04:30',
+    suspended: !!unitState?.tuning?.suspended,
+    source, deltaSource, leadSource, clampedBy,
+  }
+}
+
+function fmtNum(n) {
+  const r = Math.round(Number(n) * 10) / 10
+  return (r < 0 ? MINUS : '') + String(Math.abs(r))
+}
+
+function hmm(tz, ms) { const p = tz.localParts(ms); return `${p.hour}:${String(p.minute).padStart(2, '0')}` }
+
+// §2.4 bump: clamp(round_to_step(original ± Δ), [coolingMin | heatingMax] ∩ [61, 90]).
+function bump(original, season, deltaF, clampF, step) {
+  const cool = season === 'cooling'
+  let t = roundToStep(original + (cool ? -deltaF : deltaF), step)
+  if (cool) t = Math.min(Math.max(t, Math.max(Number(clampF?.coolingMin ?? 65), 61)), 90)
+  else t = Math.max(Math.min(t, Math.min(Number(clampF?.heatingMax ?? 76), 90)), 61)
+  return { target: t, moves: cool ? t < original - 1e-9 : t > original + 1e-9 }
+}
+
+// PlanDay fanOnlyUntil (addendum B §3.4): while the unit is in shed for `e`, the persisted auto.dryOutUntil
+// (a late join dries out from its entry read); otherwise predicted from `src` (the phase-entry read while
+// engaged, else live; a unit an ON precondition entry turns on runs in the entry's mode) by the F2.7 rule —
+// running in COOL/DRY/HEAT with FAN in the unit's caps (unknown caps count as having it) ⇒ dryOutUntilFor
+// from peakStart. null when the unit does not shed `e` or goes straight to OFF.
+function planDryOut(cfg, e, shed, auto, active, src, caps) {
+  if (shed !== 'off') return null
+  if (active && auto.phase === 'shed') return msOf(auto.dryOutUntil)
+  if (!src || String(src.power ?? '').toUpperCase() !== 'ON') return null
+  if (!hasFan(caps)) return null
+  return dryOutUntilFor(cfg, e, seasonOfMode(src.mode))
+}
+
+function hasFan(caps) {
+  const modes = caps?.modes
+  return !(Array.isArray(modes) && modes.length && !modes.some((m) => String(m).toUpperCase() === 'FAN'))
+}
+
+function timeLabel(tz, ms) { return typeof tz.formatLocal === 'function' ? tz.formatLocal(ms, 'time') : hmm(tz, ms) }
+
+// {key, at, atLabel, label} of an entry instant (tou's own, or a persisted auto.entry {key, at ISO, fields}).
+function entryRef(tz, x) {
+  if (!x) return null
+  const at = msOf(x.at)
+  return { key: x.key ?? null, at: iso(at), atLabel: at == null ? '' : hmm(tz, at), label: entryLabel(x.fields) }
+}
+
+function dryoutSkipText(v) {
+  const names = Array.isArray(v) ? v : Array.isArray(v?.units) ? v.units : []
+  if (!names.length) return null
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+  const verb = v?.season === 'heating' ? 'heating' : 'cooling'
+  return `skipped if ${list} ${names.length === 1 ? 'is' : 'are'} ${verb}`
+}
+
+function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armedAt, unitLedger) {
+  let shed = 'off'
+  if (u.shed === false) shed = 'opted out'
+  else if (us?.skipDate === e.date || ledgerEntry?.status === 'skipped') shed = 'skipped'
+  else if (ledgerEntry?.status === 'released') shed = 'released'
+
+  const auto = us?.auto
+  const active = !!auto && auto.eventId === e.id && auto.phase && auto.phase !== 'idle'
+  const src = active ? (auto.baseline ?? live) : live
+  // addendum B F3.11: the window's season comes from E* (the latest entry at or before peakStart) when it says ON
+  const pass = active && auto.params ? null : entryPass(cfg, tz, u, us, e, src?.mode, effFn, seasonOfMode, armedAt, earlyStraddles(unitLedger, e) ? null : src?.power)
+  const season = pass ? pass.season : auto.params.season
+  const eff = pass ? pass.eff : auto.params
+  const winStart = preStartOf(cfg, tz, u, e, eff)
+  const E = active ? (auto.entry ?? null) : shed === 'opted out' ? null : pass.E
+  const R = shed === 'opted out' || shed === 'skipped' ? null : active ? (auto.entry ?? null) : eventEntry(cfg, tz, u, e, Math.min(winStart, pass.E?.at ?? Infinity), e.peakEnd - 1, armedAt)
+  const eOn = E?.fields?.power === 'ON'
+  const runSrc = !active && eOn && !(shed !== 'off') ? { power: 'ON', mode: E.fields.mode } : src
+  const res = {
+    precondition: 'off', shed, preStart: null, target: null, source: null,
+    fanOnlyUntil: iso(planDryOut(cfg, e, shed, auto, active, runSrc, live?.caps)),
+    entry: entryRef(tz, E),
+    restore: !R ? null : R.fields?.power === 'OFF' ? 'stays off' : settingLabel(R.fields),
+    dryout: shed === 'off' && e.kind !== 'boundary' ? dryoutSkipText(dryoutSkip) : null, // a boundary never sheds (E1.4)
+  }
+  if (!e.precondition || u.shed === false || u.precondition === false) return res
+
+  if (!active && E?.fields.power === 'OFF') { res.precondition = 'skip: scheduled off'; return res }
+  if (eff?.suspended) { res.precondition = 'skip: paused (unit idle for days)'; return res }
+  const win = eff?.noPrecondition ? null : preconditionWindow(cfg, tz, e, season, eff)
+  if (!win) return res
+  res.preStart = iso(win.preStart)
+  res.source = eff?.source ?? 'config'
+  const tail = ` from ${hmm(tz, win.preStart)}${res.source === 'tuned' ? ' · auto-tuned' : ''}`
+  const verbOf = (s) => (s === 'cooling' ? 'cool' : 'heat')
+  const modes = Array.isArray(cfg?.precondition?.modes) ? cfg.precondition.modes : ['COOL', 'DRY', 'HEAT']
+  const sched = eOn ? ` (scheduled ${settingLabel(E.fields, { fan: false })})` : ''
+  const owned = active ? auto.owned?.temp : null
+  if (owned && Number.isFinite(Number(owned.original)) && Number.isFinite(Number(owned.applied))) {
+    const base = eOn && Number.isFinite(Number(E.fields.temp)) ? Number(E.fields.temp) : Number(owned.original)
+    const d = Number(owned.applied) - base
+    res.target = Number(owned.applied)
+    res.precondition = `${verbOf(season)} ${d < 0 ? MINUS : '+'}${fmtNum(Math.abs(d))}° → ${fmtNum(owned.applied)}°${tail}${sched}`
+    return res
+  }
+  const deltaF = Number(eff?.deltaF ?? 3)
+  const clampF = eff?.clampF ?? cfg?.precondition?.clampF
+  const step = Number(src?.tempStep) || 1
+  if (eOn) {
+    // addendum B F3.11 + C F3.11′: the target is the entry's setting; a running unit already past the bumped
+    // target in the entry's season keeps its setpoint (never un-condition); the unit may be OFF (the entry
+    // authorizes the ON).
+    const mode = String(E.fields.mode ?? '').toUpperCase()
+    const s = seasonOfMode(mode)
+    if (!s || !modes.includes(mode)) { res.precondition = `skip: scheduled mode ${modeLabel(mode) || 'unknown'}`; return res }
+    const base = Number.isFinite(Number(E.fields.temp)) ? Number(E.fields.temp) : Number(src?.temp)
+    if (!Number.isFinite(base)) { res.precondition = `±${fmtNum(deltaF)}°${tail}${sched}`; return res }
+    const { target, moves } = bump(base, s, deltaF, clampF, step)
+    const lt = Number(src?.temp)
+    const running = String(src?.power ?? '').toUpperCase() === 'ON' && seasonOfMode(src?.mode) === s && Number.isFinite(lt)
+    const kept = running ? (s === 'cooling' ? Math.min(target, lt) : Math.max(target, lt)) : target
+    if (running && Math.abs(kept - lt) < 1e-9) {
+      res.precondition = `keeps ${fmtNum(lt)}° (already ${s === 'cooling' ? 'below' : 'above'} the ${fmtNum(target)}° target)`
+      return res
+    }
+    if (!moves && !running) { res.precondition = s === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
+    res.target = kept
+    const from = running ? lt : base
+    res.precondition = `${verbOf(s)} ${kept < from ? MINUS : '+'}${fmtNum(Math.abs(kept - from))}° → ${fmtNum(kept)}°${tail}${sched}`
+    return res
+  }
+  if (!src) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
+  if (String(src.power ?? '').toUpperCase() !== 'ON') { res.precondition = 'skip: unit off'; return res }
+  const mode = String(src.mode ?? '').toUpperCase()
+  if (!season || !modes.includes(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
+  const original = Number(src.temp)
+  if (!Number.isFinite(original)) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
+  const { target, moves } = bump(original, season, deltaF, clampF, step)
+  if (!moves) { res.precondition = season === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
+  res.target = target
+  res.precondition = `${verbOf(season)} ${season === 'cooling' ? MINUS : '+'}${fmtNum(Math.abs(target - original))}° → ${fmtNum(target)}°${tail}`
+  return res
+}
+
+// Addendum E E1.10 (decide's effFor rule): a unit reading ON because of our own optimum start for an entry after a
+// boundary — an early ledger record (reason 'optimum-start' or 'dry-run', with startedAt) with startedAt < t < instant —
+// does not count as ON for that boundary event (livePower null): the early start runs as it does without the option.
+function earlyStraddles(ledger, e) {
+  if (e?.kind !== 'boundary' || !ledger) return false
+  return Object.entries(ledger).some(([k, v]) => k.startsWith('s:') && v && v.startedAt != null && (v.reason === 'optimum-start' || v.reason === 'dry-run') &&
+    msOf(v.startedAt) < e.peakStart && e.peakStart < msOf(v.instant))
+}
+
+// PlanDay.entries[unitId] (addendum B §3.4 + D E1.7/E2.11): the unit's entry instants of the date with the
+// event that folds each (null = fires on time; a skipped event never folds), `days`, and for ON entries the
+// optimum start: startAt/lead from opts.early for the one entry its result names, else earlyMax = the cap
+// when an early start is possible at all (cap > 0, the unit pre-conditions, not folded, no window overlaps
+// [at − cap, at]).
+function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedAt) {
+  const opts = { effectivePrecondition: effFn, armedAt }
+  const onFor = entryEffFor(cfg, tz, u, us, live?.mode, { ...opts, livePower: live?.power })
+  const offFor = entryEffFor(cfg, tz, u, us, live?.mode, { ...opts, livePower: null })
+  const effFor = (e) => (earlyStraddles(ledger, e) ? offFor : onFor)(e) // E1.10, as decide's effFor
+  const cap = Number(cfg?.precondition?.optimumStart)
+  return entryInstants(cfg, tz, u, date).map((x) => {
+    const ev = foldEventFor(cfg, tz, u, x.at, effFor)
+    const skipped = ev && (us?.skipDate === ev.date || ledger?.[ev.id]?.status === 'skipped')
+    const out = { key: x.key, at: iso(x.at), atLabel: hmm(tz, x.at), label: entryLabel(x.fields), fields: x.fields, folded: ev && !skipped ? ev.id : null, days: x.days }
+    if (x.fields.power !== 'ON') return out
+    if (earlyRes && earlyRes.entry?.key === x.key && Number.isFinite(msOf(earlyRes.startAt))) {
+      out.startAt = iso(msOf(earlyRes.startAt))
+      out.lead = earlyRes.lead ?? null
+    } else if (cap > 0 && u.precondition !== false && !out.folded && !eventOverlapping(cfg, tz, u, x.at - cap * MIN_MS, x.at, effFor)) {
+      out.earlyMax = cap
+    }
+    return out
+  })
+}
+
+// PlanDay.units[id].entryDryOut (addendum C §3.5, CD-5): one prediction per unit from its live read — a unit
+// reading ON in a conditioning mode, FAN in caps (unknown caps count), fanOnlyMin[season] > 0 — dries out
+// after its next OFF entry of the date (at > opts.now): until = X.at + fanOnlyMin[season]. tou's own
+// mode→season helper (a follower's live mode already is the master's; a master in Fan leaves it reading Fan).
+function planEntryDryOut(cfg, live, list, now) {
+  if (!live || String(live.power ?? '').toUpperCase() !== 'ON' || !hasFan(live.caps)) return undefined
+  const s = seasonOfMode(live.mode)
+  const min = s ? Number(pick(cfg?.shed?.fanOnlyMin, s) ?? FAN_ONLY_MIN[s]) : 0
+  if (!(min > 0)) return undefined
+  const x = list.find((y) => y.fields.power === 'OFF' && msOf(y.at) > now)
+  return x ? { until: iso(msOf(x.at) + min * MIN_MS) } : undefined
+}
+
+// PlanDay.markers (addendum D E4.4/§1.6): entry marks grouped by (kind, at) across units, with structured lines.
+// `evById`: the PlanDay events by id. A folded entry marks the event's end; for a boundary event (addendum E §3.4)
+// the entry at t notes the unit's pre-condition start, one before t that it applies when the pre-condition ends.
+function planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf) {
+  const out = []
+  const add = (m) => {
+    const hit = out.find((o) => o.kind === m.kind && o.at === m.at && o.end === m.end)
+    if (hit) { hit.units.push(...m.units); hit.lines.push(...m.lines) } else out.push(m)
+  }
+  for (const u of units) {
+    const list = entries[u.id] ?? []
+    const dry = perUnit[u.id]?.entryDryOut ?? null
+    const untilMs = msOf(dry?.until)
+    let dryEntry = null
+    if (untilMs != null) for (const x of list) if (x.fields.power === 'OFF' && msOf(x.at) < untilMs && (!dryEntry || msOf(x.at) > msOf(dryEntry.at))) dryEntry = x
+    for (const x of list) {
+      const line = { unit: u.id, name: u.name ?? u.id, at: x.at, label: x.label, note: null }
+      if (x.folded) {
+        const ev = evById.get(x.folded)
+        const end = msOf(ev?.peakEnd)
+        if (ev?.kind === 'boundary') {
+          line.note = msOf(x.at) < end ? `applies at ${timeLabel(tz, end)} when the pre-condition ends` : `pre-conditioned from ${timeLabel(tz, msOf(ev.units[u.id]?.preStart ?? ev.preStart))}`
+        } else line.note = end != null ? `applies at ${timeLabel(tz, end)} when the peak ends` : 'applies when the peak ends'
+        add({ at: iso(end ?? msOf(x.at)), kind: 'folded', units: [u.id], lines: [line] })
+        continue
+      }
+      if (x.startAt) {
+        const room = Number(liveOf(u.id)?.room)
+        line.note = `starts ~${timeLabel(tz, msOf(x.startAt))}${Number.isFinite(room) ? ` (room ${fmtNum(room)}°)` : ''}`
+      } else if (x.earlyMax) line.note = `may start up to ${x.earlyMax} min early`
+      else if (x === dryEntry) line.note = `fan-only, then off at ${timeLabel(tz, untilMs)}`
+      add({ at: x.at, kind: 'entry', units: [u.id], lines: [line] })
+      if (x.startAt) add({ at: x.startAt, end: x.at, kind: 'start', units: [u.id], lines: [] })
+      if (x === dryEntry) add({ at: x.at, end: dry.until, kind: 'dryout', units: [u.id], lines: [] })
+    }
+  }
+  return out.sort((a, b) => msOf(a.at) - msOf(b.at))
+}
+
+/**
+ * PlanDay (§4.4) for a local date.
+ * @param opts.live  map {unitId: live} or function unitId → live|null (the host's live reads); used for the
+ *                   per-unit precondition text when the unit does not own the event.
+ * @param opts.effectivePrecondition  inject tuning.effectivePrecondition (else §5.2 fallback).
+ * @param opts.early  {unitId: early.optimumStart result | null} (addendum D E2.11, injected like the eff).
+ * @param opts.dryoutSkip  {unitId: [names] | {units:[names], season}} — the master's keepsConditioning forecast,
+ *                   computed by the host (the reference app's multi-split module, addendum C CD-5); tou only words it.
+ * @param opts.now  epoch ms: entryDryOut looks at OFF entries after it (default: the whole date).
+ * Per-unit event entries: {precondition:text, shed:text, preStart:ISO|null, target:number|null, source,
+ *   fanOnlyUntil:ISO|null, entry:{key, at, atLabel, label}|null, restore:"Heat 70° · Low"|"stays off"|null,
+ *   dryout:'skipped if <unit> is cooling'|null} (fanOnlyUntil: planDryOut — the fan-only deadline, null =
+ *   straight to OFF; entry: the precondition target entry — auto.entry while engaged; restore: what the
+ *   folded entry leaves the unit at when the peak ends).
+ * Precondition texts: "cool −3° → 71° from 5:00", "heat +4° → 74° from 4:30 · auto-tuned",
+ * "heat +3° → 73° from 5:00 (scheduled Heat 70°)", "keeps 68° (already below the 71° target)",
+ * "skip: scheduled off", "skip: scheduled mode Fan", "skip: unit off", "skip: mode FAN",
+ * "skip: already at floor|ceiling", "off". Shed texts: "off" | "opted out" | "skipped" | "released".
+ * PlanDay also carries entries {unitId: [{key, at, atLabel, label, fields, folded, days, startAt?, lead?,
+ * earlyMax?}]} (planEntries), units {unitId: {entryDryOut?: {until}}} and markers [{at, end?, kind:'entry'|
+ * 'folded'|'start'|'dryout', units, lines:[{unit, name, at, label, note}]}] (planMarkers).
+ * Addendum E: events[] carry kind 'peak' | 'boundary'; a boundary event's units have fanOnlyUntil null and dryout
+ * null, `precondition` 'off' for a unit it does not engage (E1.8); entries[u][j].folded = the boundary's id for the
+ * unit's ON entry at t when it pre-conditions (see plan()); folded-marker notes "pre-conditioned from 5:00 AM" (the
+ * entry at t) / "applies at 7:00 AM when the pre-condition ends" (an entry inside the window).
+ * A unit whose ON read is our own optimum start for an entry after the boundary (its early ledger record straddles t)
+ * is judged not ON for that boundary (E1.10, decide's effFor rule), so the plan shows no pre-condition for it.
+ */
+export function plan(cfg, state, tz, date, opts = {}) {
+  const liveOf = typeof opts.live === 'function' ? opts.live : (id) => opts.live?.[id] ?? null
+  const effFn = typeof opts.effectivePrecondition === 'function' ? opts.effectivePrecondition : fallbackEff
+  const now = Number.isFinite(opts.now) ? opts.now : -Infinity
+  const units = (Array.isArray(cfg?.units) ? cfg.units : [])
+    .map((u, i) => ({ u, i }))
+    .sort((a, b) => (a.u.order ?? a.i) - (b.u.order ?? b.i) || a.i - b.i)
+    .map((x) => x.u)
+  const holiday = isHoliday(cfg?.holidays, date)
+  const dayEvents = events(cfg, tz, date)
+  const evs = dayEvents.map((e) => {
+    const perUnit = {}
+    let unitPre = null
+    for (const u of units) {
+      const us = state?.units?.[u.id] ?? null
+      const entry = unitPlan(cfg, tz, e, u, us, state?.ledger?.[u.id]?.[e.id] ?? null, liveOf(u.id), effFn, opts.dryoutSkip?.[u.id], armedAtOf(state, u.id), state?.ledger?.[u.id])
+      perUnit[u.id] = entry
+      if (entry.preStart && (unitPre === null || entry.preStart < unitPre)) unitPre = entry.preStart
+    }
+    let preStart = unitPre
+    if (preStart === null && e.precondition) {
+      const w = [preconditionWindow(cfg, tz, e, 'heating'), preconditionWindow(cfg, tz, e, 'cooling')].filter(Boolean)
+      if (w.length) preStart = iso(Math.min(...w.map((x) => x.preStart)))
+    }
+    return { id: e.id, kind: e.kind, preStart, peakStart: iso(e.peakStart), peakEnd: iso(e.peakEnd), precondition: !!e.precondition, units: perUnit }
+  })
+  const entries = {}
+  const perUnit = {}
+  for (const u of units) {
+    const us = state?.units?.[u.id] ?? null
+    entries[u.id] = planEntries(cfg, tz, date, u, us, state?.ledger?.[u.id], liveOf(u.id), effFn, opts.early?.[u.id] ?? null, armedAtOf(state, u.id))
+    const dry = planEntryDryOut(cfg, liveOf(u.id), entries[u.id], now)
+    perUnit[u.id] = dry ? { entryDryOut: dry } : {}
+  }
+  // addendum E §3.4: a unit's ON entry AT a boundary is its pre-condition's target, applied by the return at t — it
+  // folds into the boundary event when the unit pre-conditions for it (text neither 'off' nor a skip) and the event
+  // is not skipped (a skipped event never folds); foldEventFor alone never folds it (the event is over at t)
+  for (const e of evs) {
+    if (e.kind !== 'boundary') continue
+    for (const u of units) {
+      const pu = e.units[u.id]
+      if (pu.shed === 'skipped' || pu.precondition === 'off' || /^skip/.test(pu.precondition)) continue
+      const x = entries[u.id].find((y) => y.fields.power === 'ON' && y.at === e.peakStart)
+      if (x) x.folded = e.id
+    }
+  }
+  // an entry of this date folds only into an event of this date (windows never cross midnight; preStart ≥ 03:00)
+  const evById = new Map(evs.map((e) => [e.id, e]))
+  return {
+    date,
+    dow: dowOf(date),
+    dayType: dayType(cfg, date),
+    holiday: holiday ? holiday.name : null,
+    segments: segments(cfg, tz, date).map((s) => ({ tier: s.tier, start: iso(s.start), end: iso(s.end), localStart: s.localStart, localEnd: s.localEnd })),
+    events: evs,
+    entries,
+    units: perUnit,
+    markers: planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf),
+  }
+}
