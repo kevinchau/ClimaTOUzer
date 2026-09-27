@@ -46,6 +46,8 @@ through an injected time zone, so results are identical on any machine.
   a window with nothing to shed.
 - **Daily plans with entries.** Scheduled daily settings per unit (`tou.unitEntries`, `tou.entryInstants`,
   `tou.entryInEffect`, `tou.nextEntry`, `tou.entryEffFor`) and `tou.plan`, one printable day with per-unit texts.
+  An On entry may keep the mode and carry a cool-to / heat-to pair; `tou.resolveEntry` turns it into concrete
+  settings for the mode the unit will run, which the host supplies as a run context.
 - **Effective parameters per season, frozen at take.** `tuning.effectivePrecondition` resolves the base or tuned
   Δ and lead with a read-time guardrail clamp; `tuning.snapshotParams` freezes them when a run starts so nothing can
   move a running window.
