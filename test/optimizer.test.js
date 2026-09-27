@@ -2,6 +2,7 @@
 // heating AND the mirrored cooling case (one signed code path), the §5.5 worked-example Δ* vectors,
 // evidence freshness, gates, an end-to-end check on real rollups (usage-gen → rollup.js → optimizer),
 // and a seeded property suite over 2 000 contexts (+ its cooling mirror).
+// Release 4.2 (Addendum F rule 10, D-check-6): a replanned episode is never E (qualifying / fresh).
 //
 // Mirror convention: every scenario is written in the heating view with comfort band 68–78 °F; the
 // cooling twin reflects every room/outdoor temperature about 73 °F (T → 146 − T), flips HEAT → COOL and
@@ -116,7 +117,7 @@ function ep(season, o) {
   return {
     ev: `${o.date}@${at}`, date: o.date, unit: 'office', ...(o.kind ? { kind: o.kind } : {}), peakStart: ps, peakEnd: pe, precondition: o.precondition ?? morning,
     preStart: par ? ps - par.leadMin * 60 : null, status, season: o.season === undefined ? season : o.season, par,
-    dryRun: !!o.dryRun, preSkipped: o.preSkipped ?? null, preFromOff: !!o.preFromOff, pre, shed, rec: null,
+    dryRun: !!o.dryRun, preSkipped: o.preSkipped ?? null, preFromOff: !!o.preFromOff, ...(o.replanned ? { replanned: true } : {}), pre, shed, rec: null,
     released: status === 'released' ? { t: ps + 1800, by: 'external', f: 'power', v: 'ON' } : null,
     overrides, jobs: { retries: 0, failing: o.failing ?? 0, blocked: o.blocked ?? 0 }, q: o.q ?? (o.dryRun ? 'dry' : boundary ? 'pre_only' : 'ok'),
     // addendum C C6.1: forced intervals given as [{mode, sameSeason?, fromMin?, untilMin?}] minutes after preStart
@@ -854,6 +855,24 @@ describe('Release 4.1 boundary episodes (addendum E E1.15): realisation only', (
       assert.deepEqual(decision(off), decision(r))
       assert.equal(off.change.evidence.windowLabel, '4–7 PM')
     })
+})
+
+describe('Release 4.2 evidence (Addendum F rule 10, D-check-6): a re-planned precondition is never E', () => {
+  test('qualifying and fresh drop a replanned episode; episodes without the key are unchanged', () => {
+    for (const season of SEASONS) {
+      const ids = (eps) => eps.map((e) => e.ev)
+      const peaks = [okEp(D), okEp(WD[1])]
+      const ctx = mkCtx(season, { eps: [okEp(D, { replanned: true }), okEp(WD[1])] })
+      assert.deepEqual(ids(O.qualifying(ctx, season)), [`${WD[1]}@07:00`], season)
+      assert.deepEqual(ids(O.fresh(ctx, season)), [`${WD[1]}@07:00`], season)
+      assert.deepEqual(ids(O.qualifying(mkCtx(season, { eps: peaks }), season)), [`${D}@07:00`, `${WD[1]}@07:00`], `${season}: no key, as before`)
+    }
+  })
+  // its preStart is the re-plan instant: leadUsed never tested par.leadMin, so a missed target says nothing about the lead
+  both('a re-planned morning that missed its target never proposes leadMin (R1_LEAD) — nothing fresh is left: learning',
+    { eps: [breach({ reached: false, eff: 0.5, Tpk: 72.3, app: 73, replanned: true })] }, HOLD('learning'))
+  both('the same morning without the re-plan steps the lead (the control)',
+    { eps: [breach({ reached: false, eff: 0.5, Tpk: 72.3, app: 73 })] }, CHANGE('leadMin', 120, 150, 'R1_LEAD'))
 })
 
 describe('stepFor / clampStep (§5.7)', () => {

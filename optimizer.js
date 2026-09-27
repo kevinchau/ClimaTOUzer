@@ -76,6 +76,15 @@
 //   • X1.2: a CONFIGURED lead longer than peakStart − earliestStart is never tuned (the validator's warning): UP cannot
 //     grow it and DOWN never picks it — not even when one step would land back inside — so DOWN steps Δ (else guardrail).
 //
+// Release 4.2 evidence (Addendum F rule 10, D-check-6):
+//   • A replanned episode (rollup: a keep-mode entry's precondition re-planned for a new season before anything was
+//     sent — its preStart is the re-plan instant, so leadUsed never tested par.leadMin and a missed target would be a
+//     false R1_LEAD) leaves E (qualifying — so F, every UP/DOWN rule and its evidence). The drift fit keeps it (its shed
+//     is an ordinary one) and so does the realisation (T0 and eff over the lead it did run are the room's physics) —
+//     unless, re-planned out of an unknown season, it carries that morning's season_unknown notice (preSkipped).
+//     The per-mode setpoint a forced mode change brings back (F rule 12) needs nothing here: the mirror never copies
+//     `recalled`, and a morning forced by the master is already out of E (forcedByMaster).
+//
 // Release 4.1 evidence (addendum E E1.15 — the weekend pre-condition's boundary episodes, rollup kind 'boundary'):
 //   • A boundary episode (a weekend/holiday pre-condition toward the super off-peak → off-peak step, no shed) is never E
 //     (qualifying/takesPart — so never F, R1/R2/R5 or any step's evidence: those rules read the shed's comfort class,
@@ -403,10 +412,11 @@ const takesPart = (ep, season) => ep.season === season && ep.precondition === tr
  * dry-run, status ∈ {done, released}, q ≠ 'dry'; newest first. Release 4 (see the header): no preSkipped
  * episode, none forced by the master, and only the newest qualifying episode's preFromOff regime.
  * Release 4.1: never a boundary episode (kind 'boundary', addendum E E1.15).
+ * Release 4.2: never a replanned one (Addendum F rule 10, see the header).
  */
 export function qualifying(ctx, season) {
   const c = buildContext(ctx)
-  const base = episodesIn(c, c.windowDates).filter((ep) => takesPart(ep, season) && !ep.preSkipped && !forcedByMaster(ep))
+  const base = episodesIn(c, c.windowDates).filter((ep) => takesPart(ep, season) && !ep.preSkipped && !ep.replanned && !forcedByMaster(ep))
   const regime = !!base[0]?.preFromOff
   return base.filter((ep) => !!ep.preFromOff === regime)
 }

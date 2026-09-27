@@ -253,7 +253,8 @@ applied from `applyDate` (today before `earliestStart`, else tomorrow). Evidence
 
 - **E** (`qualifying`): this unit's episodes in the report window (default 14 days) with the current season, a
   pre-conditioned event, not dry run, status `done` or `released`, not skipped because the room was already
-  conditioned, not forced by a multi-split master, not a boundary episode. Newest first.
+  conditioned, not forced by a multi-split master, not a boundary episode, not `replanned` (its lead ran from the
+  re-plan instant, so it never tested the configured one). Newest first.
 - **F** (`fresh`), the only evidence a step may use: episodes of E measured **after the last change**
   (`peakStart ≥ evidenceFrom`, bumped by every mutation) and **under the current parameters**
   (`par` equal to the current effective `{deltaF, leadMin}`).
