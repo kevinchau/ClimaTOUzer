@@ -347,7 +347,7 @@ Constants: `PRESETS`, `PRESET_LABELS`.
 | `explain.paramLabel`, `valueLabel`, `deltaLabel`, `startLabel`, `clockLabel`, `temp`, `num` | "+4° from 5:00", "4:30", "66.5°" |
 | `explain.seasonWords(season)`, `nameOf(names, unitId)`, `plural(word, n)` | wording helpers |
 | `labels.tierLabel`, `modeLabel`, `fanLabel` | "Super off-peak", "Heat", "Medium (auto)" |
-| `labels.settingLabel(fields, opts?)`, `entryLabel(fields, opts?)`, `daysLabel(days)` | "Heat 70° · Low", "On · Heat 70° · Low", "weekdays" |
+| `labels.settingLabel(fields, opts?)`, `entryLabel(fields, opts?)`, `daysLabel(days)` | "Heat 70° · Low", "On · Heat 70° · Low", "weekdays"; `opts.season` words an entry that keeps the mode or carries `coolTo`/`heatTo`: "heat to 68°", "cool to 74° / heat to 68°", "keep mode" |
 | `records.mirrorActivity(entry, nowMs)` | the `a` record of an action line, or null |
 
 Constants: `labels.TIER_LABELS`, `MODE_LABELS`, `FAN_LABELS`; `records.RECORD_KINDS`, `MIRRORED_TYPES`.
