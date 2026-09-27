@@ -169,7 +169,7 @@ One episode per unit and event. Markers are the `a` records of that event; `s` i
 
 | Quantity | Definition |
 |---|---|
-| `par` | the frozen `{deltaF, leadMin}` of the `phase_enter(precondition)` line |
+| `par` | the frozen `{deltaF, leadMin}` of the event's last `phase_enter(precondition)` line (a keep-mode entry's precondition re-planned for a new season before anything was sent logs a second one: the episode is then `replanned`, and `preStart` and the setpoint take are the last one's) |
 | `T0` | median room over `[preStart − 15 min, preStart)` (for a run that turned the unit on from an entry: the scheduled setpoint) |
 | `Tpk` | median room over `[peakStart − 15 min, peakStart)` |
 | `dApp` | `|applied − original|` of the setpoint take |

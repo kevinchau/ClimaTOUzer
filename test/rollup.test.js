@@ -2,6 +2,7 @@
 // stats, episode extraction (precondition, OFF-only drift fit after settle, comfort class, sensor flags,
 // was_off/dry/released episodes, overrides with comfortDir + HomeKit `auto` pattern), outdoor back-fill,
 // command counts, DST day lengths, the golden fixture and byte-identical rebuilds.
+// Release 4.2 (Addendum F rule 10, A §4.6): a re-planned precondition reads its last phase_enter (replanned: true).
 // Data comes from test/helpers/usage-gen.js (reference recorder: deterministic, no files) and from small
 // hand-built record sets. Re-runs itself under TZ=UTC and TZ=Asia/Tokyo.
 import test from 'node:test'
@@ -1299,4 +1300,64 @@ test('Release 4.1 (E1.14): boundary episodes as decide logs them — running, fr
   const dry = [...warm, ...running].map((x) => (x.k === 'a' && x.ty === 'phase_enter' ? { ...x, dry: true } : x))
   const [g] = await roll1(dry)
   assert.deepEqual([g.kind, g.status, g.q], ['boundary', 'dry', 'dry'])
+})
+
+test('Release 4.2 (Addendum F rule 10, A §4.6): a re-planned precondition — the last phase_enter, the first temp take at or after it, replanned: true; one phase_enter has no replanned key', async () => {
+  const D = DAY
+  const am = `${D}@07:00`
+  // the master bedroom's 07:00 On · keep mode · cool to 74° / heat to 70°, OFF overnight remembering Cool at 72: engaged at
+  // 05:00 for cooling (nothing sent — the ON waits for its 05:00:40 slot); the living room turned on in Heat at 05:00:30,
+  // so the next step (05:00:35) re-planned for heating: the unsent temp take un-owned as system, a second mirrored
+  // precondition phase_enter with the heating params (its own Δ, the window kept), the heating takes, then the one-frame ON
+  const entry = { key: `s:${D}@07:00`, fields: { power: 'ON', coolTo: 74, heatTo: 70 } }
+  const PARAMS_H4 = { ...PARAMS_H, deltaF: 4 }
+  const replan = (withSecond) => lines(D, 'office', am, [
+    ['05:00', 0, { type: 'phase_enter', phase: 'precondition', season: 'cooling', params: PARAMS_C, entry: { ...entry, season: 'cooling', resolved: { season: 'cooling', temp: 74 } } }],
+    ['05:00', 0, { type: 'take', field: 'power', original: 'OFF', applied: 'ON', phase: 'precondition', entry: entry.key }],
+    ['05:00', 0, { type: 'take', field: 'temp', original: 72, applied: 71, base: 74, phase: 'precondition', entry: entry.key }],
+    ['05:00', 0, { type: 'take', field: 'fan', original: 'LOW', applied: 'HIGH', phase: 'precondition', entry: entry.key }],
+    ...(withSecond
+      ? [
+        ['05:00', 35, { type: 'drop', actor: 'system', field: 'temp', live: 72, reason: 'season', season: 'cooling' }],
+        ['05:00', 35, { type: 'phase_enter', phase: 'precondition', reason: 'season_changed', season: 'heating', params: PARAMS_H4, entry: { ...entry, season: 'heating', resolved: { season: 'heating', mode: 'HEAT', temp: 70 } }, by: 'living-room', byMode: 'HEAT' }],
+        ['05:00', 35, { type: 'take', field: 'mode', original: 'COOL', applied: 'HEAT', phase: 'precondition', entry: entry.key }],
+        ['05:00', 35, { type: 'take', field: 'temp', original: 72, applied: 74, base: 70, phase: 'precondition', entry: entry.key }],
+        ['05:00', 43, { type: 'write', field: 'power', from: 'OFF', to: 'ON', kind: 'take', withMode: 'HEAT', result: 'verified' }],
+        ['05:00', 46, { type: 'write', field: 'temp', from: 72, to: 74, kind: 'take', result: 'verified' }],
+      ]
+      : [
+        ['05:00', 43, { type: 'write', field: 'power', from: 'OFF', to: 'ON', kind: 'take', result: 'verified' }],
+        ['05:00', 46, { type: 'write', field: 'temp', from: 72, to: 71, kind: 'take', result: 'verified' }],
+      ]),
+    ['07:00', 0, { type: 'phase_enter', phase: 'shed', from: 'precondition', season: withSecond ? 'heating' : 'cooling', params: withSecond ? PARAMS_H4 : PARAMS_C }],
+    ['07:00', 0, { type: 'take', field: 'power', original: 'OFF', from: 'ON', applied: 'OFF', phase: 'shed' }],
+    ['07:00', 3, { type: 'write', field: 'power', from: 'ON', to: 'OFF', kind: 'take', result: 'verified' }],
+    ['10:00', 0, { type: 'phase_exit', phase: 'shed', reason: 'ended' }],
+  ])
+  const room = (i) => Math.round((64 + i * 0.25) * 100) / 100
+  const recs = [
+    ...buckets(D, '04:00', '05:05', () => ({ on: 0, p: 0, m: 'COOL', sp: 72, r: 64 })),
+    ...buckets(D, '05:05', '07:00', (i) => ({ sp: 74, f: 'HIGH', r: room(i) })),
+    ...buckets(D, '07:00', '10:00', (i) => ({ on: 0, p: 0, sp: 74, r: 69 - i * 0.02 })),
+  ]
+  const [ep] = (await rollupDay({ date: D, records: [...recs, ...replan(true)], cfg: cfgWith(), tz })).units.office.episodes
+  assert.equal(ep.replanned, true, 'more than one precondition phase_enter')
+  assert.deepEqual(
+    { status: ep.status, season: ep.season, par: ep.par, preStart: ep.preStart, preFromOff: ep.preFromOff, preSkipped: ep.preSkipped },
+    { status: 'done', season: 'heating', par: { deltaF: 4, leadMin: 120 }, preStart: at(D, '05:00', 35), preFromOff: true, preSkipped: null },
+    'season, par and preStart from the last phase_enter; the first power take still decides preFromOff',
+  )
+  assert.deepEqual(
+    { orig: ep.pre.orig, app: ep.pre.app, dApp: ep.pre.dApp, capped: ep.pre.capped, T0: ep.pre.T0, T0room: ep.pre.T0room, leadUsed: ep.pre.leadUsed },
+    { orig: 70, app: 74, dApp: 4, capped: false, T0: 70, T0room: 64, leadUsed: 119 },
+    'the heating take after the re-plan (base 70), never the dropped cooling one; leadUsed from the re-plan instant',
+  )
+  // a re-plan that took no setpoint after it (the new season's target already met): the dropped take is never the episode's
+  const noTake = replan(true).filter((a) => !(a.ty === 'take' && a.f === 'temp' && a.bs === 70))
+  const [nt] = (await rollupDay({ date: D, records: [...recs, ...noTake], cfg: cfgWith(), tz })).units.office.episodes
+  assert.deepEqual([nt.replanned, nt.season, nt.preStart, nt.pre], [true, 'heating', at(D, '05:00', 35), null])
+  // one precondition phase_enter (no re-plan): no replanned key at all — the episode reads exactly as before Addendum F
+  const [one] = (await rollupDay({ date: D, records: [...recs, ...replan(false)], cfg: cfgWith(), tz })).units.office.episodes
+  assert.ok(!('replanned' in one), 'no replanned key')
+  assert.deepEqual([one.season, one.preStart, one.pre.orig, one.pre.app, one.par], ['cooling', at(D, '05:00'), 74, 71, { deltaF: 3, leadMin: 120 }])
 })

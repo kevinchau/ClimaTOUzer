@@ -58,12 +58,19 @@
 // { ev, date, unit, kind: 'peak'|'boundary', peakStart, peakEnd, precondition (event flag), preStart|null,
 //   status: 'done'|'released'|'skipped'|'was_off'|'dry'|'absent', season, par: {deltaF, leadMin}|null, dryRun,
 //   (was_off ⇔ the FIRST take power line is OFF → OFF, addendum B F3.21 C-12; season: phase_enter(precondition).se
-//    first, then the take temp sign against base ?? fr (C-4), then the shed's se, then the mode at peakStart)
+//    first, then the take temp sign against base ?? fr (C-4), then the shed's se, then the mode at peakStart;
+//    phase_enter(precondition) = the event's LAST one, and the take temp the first at or after it — see replanned)
 //   (dryRun ⇔ an `a` phase_enter of the event has dry: true — entered in dry run — or, for lines logged before
 //    that flag, would_write with no take and no scheduler write; ⇒ status 'dry', par null, q 'dry')
 //   preSkipped: the notice's reason ('already conditioned', 'season_mismatch', …) else its code | null (CD-11),
 //   conditioned: {keeps, target} | null   (C F3.11′: the silent 'already conditioned' line — no pre-conditioning ran),
 //   preFromOff: bool   (B F3.21: the first take power line is OFF → ON — the precondition turned the unit on for an entry),
+//   replanned: true — only when the event has more than one precondition phase_enter (Release 4.2, Addendum F rule 10: a
+//    keep-mode precondition re-planned for a new season before anything was sent logs a second one, reason
+//    'season_changed', with the new season's params and the window kept); season, par, preStart and pre then come from
+//    the last one and the first take temp at or after it (the takes before it were un-owned unsent). The key is absent
+//    otherwise (an episode with one phase_enter reads exactly as before); the optimizer leaves such an episode out of E
+//    (its leadUsed runs from the re-plan instant, not par.leadMin),
 //   pre:  {orig, app, dApp, capped, T0, T0room, Tpk, rise, eff, reached, t90, reachedMinBeforePeak, leadUsed} | null,
 //    (orig = take(temp).base ?? fr — the scheduled setpoint when the bump came from an entry; T0room = the measured
 //     room before preStart; T0 = orig for a preFromOff episode (C-3: rise/eff/t90 over the bump above the scheduled
@@ -491,9 +498,14 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
     const pe = msEvent ? Number(e.peakEnd) / 1000 : Number(e.peakEnd)
     const boundary = pe <= ps // addendum E: a boundary event — an empty peak, precondition only (see the header)
     const M = A.filter((a) => a.e === e.id)
-    const pePre = findMarker(M, (a) => a.ty === 'phase_enter' && a.ph === 'precondition')
+    // Addendum F rule 10: a precondition re-planned for a new season before anything was sent logs a second phase_enter
+    // (reason 'season_changed'); the episode is the last one's — its season, params, preStart and the first temp take
+    // at or after it (the takes before it were dropped unsent) — and says so (replanned)
+    const pres = M.filter((a) => a.ty === 'phase_enter' && a.ph === 'precondition')
+    const pePre = pres.length ? pres[pres.length - 1] : null
+    const replanned = pres.length > 1
     const peShed = findMarker(M, (a) => a.ty === 'phase_enter' && a.ph === 'shed')
-    const takeTemp = findMarker(M, (a) => a.ty === 'take' && a.f === 'temp')
+    const takeTemp = findMarker(pePre ? M.slice(M.indexOf(pePre)) : M, (a) => a.ty === 'take' && a.f === 'temp')
     const takePower = findMarker(M, (a) => a.ty === 'take' && a.f === 'power')
     const released = findMarker(M, (a) => a.ty === 'released')
     const skipped = findMarker(M, (a) => a.ty === 'skipped')
@@ -720,7 +732,7 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
       kind: boundary ? 'boundary' : 'peak', peakStart: ps, peakEnd: pe, precondition: !!e.precondition, preStart,
       status, season, par, dryRun, preSkipped: preNotice ? String(preNotice.rs ?? preNotice.why) : null,
       conditioned: preNotice?.rs === 'already conditioned' ? { keeps: isNum(preNotice.to) ? Number(preNotice.to) : null, target: isNum(preNotice.fr) ? Number(preNotice.fr) : null } : null,
-      preFromOff,
+      preFromOff, ...(replanned ? { replanned: true } : {}),
       pre, shed, fanOnly, rec,
       released: rel ? { t: Number(rel.t), by: rel.ac === 'dashboard' ? 'user' : 'external', f: rel.f ?? null, v: rel.to ?? null } : null,
       overrides,
