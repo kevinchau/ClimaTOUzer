@@ -59,6 +59,21 @@
 //   while the master's bucket has p = 1 in a mode of ANOTHER season — by season, so a Dry master over a Cool follower
 //   is never standby), each intersected with the unit's p = 1 buckets (forcing changes nothing on an OFF unit).
 //
+// Unit kinds (INJECTED — the core knows no device kind; reference-app Addendum G §2.2 §4.5 / §4.6): rollupDay({…,
+//   unitRules}) takes (unitId) → {shed?: 'off' | 'setback', seasonOf?(mode) → season, floorF?} | null (null ⇒ a heat
+//   pump's rules, every output as before). seasonOf decides UnitRollup.season (the majority of ON minutes by the kind's
+//   season — a water heater's 'Heat Pump' is 'water') and an episode's fallback season; a phase line's se may be
+//   'water' too. 's' records may carry rn (running seconds — the heater heating) and hw (the hot-water level 'full' |
+//   'some' | 'low'): UnitRollup.runMin {peak, off_peak, super_off_peak, total} appears when any bucket has rn.
+//   A setback unit (shed 'setback') is ON through its shed: the episode carries shedKind 'setback'; offAt = the
+//   scheduler's verified shed TEMP write (at or after peakStart), shed.sp its setpoint; comfort points = every bucket
+//   with a reading in [offAt, shedEnd); drift points stop at the first bucket at or below sp + 1 °F (the heater
+//   restarted); class / violMin against floorF (the tank's comfortMinF) when given, else the band; rec.onAt = the
+//   verified RETURN temp write after the shed's exit; shed gains {sp, floorMin (minutes at or below the floor), lowMin
+//   (minutes at hot-water level 'low'), ranMin (minutes running, null without rn), levels {first, last} | null}; a
+//   bucket with a level counts for coverage; q 'no_sensor' (after 'pre_only') when the event's window has neither a
+//   reading nor a level. classify / comfortDirOf accept the 'water' season (the heating direction).
+//
 // Multi-split constraint (INJECTED — the core imports no device topology): rollupDay({…, constraint}) takes
 //   {on, master, forcing, conflict}. On a multi-split system one outdoor unit serves several indoor units and the
 //   master's mode can force a follower's; the reference app passes its system.constraint(cfg). `constraint` decides
@@ -154,6 +169,7 @@ function roleIn(c, cfg, unitId) {
 }
 
 const TIERS = ['peak', 'off_peak', 'super_off_peak']
+const SEASONS3 = new Set(['heating', 'cooling', 'water']) // an episode's season (a host's water heater: 'water')
 const BUCKET = 300 // s
 const SETTLE = 600 // s (10 min)
 const MAX_JOB_ITEMS = 10
@@ -233,6 +249,8 @@ function normBuckets(list) {
       sp: isNum(r.sp) ? Number(r.sp) : null,
       f: r.f ?? null,
     }
+    if (isNum(r.rn)) b.rn = clampNum(Number(r.rn), 0, b.cv) // a host's running seconds (a water heater's, G §3.2)
+    if (typeof r.hw === 'string') b.hw = r.hw // the hot-water level (full | some | low)
     b.on = clampNum(isNum(r.on) ? Number(r.on) : 0, 0, b.cv)
     const last = out[out.length - 1]
     if (last && last.t === b.t) {
@@ -243,6 +261,8 @@ function normBuckets(list) {
       last.cv = Math.min(BUCKET, last.cv + b.cv)
       last.on = Math.min(last.cv, last.on + b.on)
       if (b.p != null) { last.p = b.p; last.m = b.m; last.sp = b.sp; last.f = b.f }
+      if (b.rn != null) last.rn = Math.min(last.cv, (last.rn ?? 0) + b.rn)
+      if (b.hw != null) last.hw = b.hw
       continue
     }
     out.push(b)
@@ -316,7 +336,7 @@ export function classify(points, band, season, marginF = 1, comfyMarginF = 2, co
   if (!rs.length) return { class: 'unknown', m: null, violMin: 0, Tmin: null, Tmax: null }
   const Tmin = Math.min(...rs)
   const Tmax = Math.max(...rs)
-  if (season !== 'heating' && season !== 'cooling') return { class: 'unknown', m: null, violMin: 0, Tmin: round1(Tmin), Tmax: round1(Tmax) }
+  if (season !== 'heating' && season !== 'cooling' && season !== 'water') return { class: 'unknown', m: null, violMin: 0, Tmin: round1(Tmin), Tmax: round1(Tmax) }
   const { L, H } = bandOf(band)
   const s = seasonSign(season)
   const zEdge = s > 0 ? L : -H
@@ -513,7 +533,7 @@ function nominalStart(cfg, tz, e, ps, pe, preStart, season) {
 function findMarker(M, pred) { for (const a of M) if (pred(a)) return a; return null }
 
 function comfortDirOf(o, season, offAt) {
-  const s = season === 'heating' ? 1 : season === 'cooling' ? -1 : 0
+  const s = season === 'heating' || season === 'water' ? 1 : season === 'cooling' ? -1 : 0
   if (o.f === 'power') return up(o.v) === 'ON' && offAt != null && o.t >= offAt
   if (o.f === 'temp') return s !== 0 && isNum(o.v) && isNum(o.o) && s * (Number(o.v) - Number(o.o)) > 0
   if (o.f === 'mode') return (season === 'heating' && up(o.v) === 'HEAT') || (season === 'cooling' && (up(o.v) === 'COOL' || up(o.v) === 'DRY'))
@@ -542,7 +562,9 @@ function comfortDirOf(o, season, offAt) {
  * @param {object} [a.cfg]    the config (the nominal pre-condition window of an away episode; without it the peak)
  * @returns {Array} Episode[]
  */
-export function buildEpisodes({ unitId, buckets, changes, markers, events, band, outdoor, marginF = 1, comfyMarginF = 2, tz, extHistory = [], prevTail = null, date = null, forced = [], tierOf = null, away = [], cfg = null }) {
+export function buildEpisodes({ unitId, buckets, changes, markers, events, band, outdoor, marginF = 1, comfyMarginF = 2, tz, extHistory = [], prevTail = null, date = null, forced = [], tierOf = null, away = [], cfg = null, rules = null }) {
+  const setback = rules?.shed === 'setback'
+  const seasonOfM = typeof rules?.seasonOf === 'function' ? rules.seasonOf : seasonOfMode
   const B = normBuckets((buckets ?? []).slice())
   const C = (changes ?? []).slice().sort((a, b) => a.t - b.t)
   const A = (markers ?? []).slice().sort((a, b) => a.t - b.t)
@@ -588,13 +610,13 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
     // entry bumps the scheduled setpoint, not the overnight one) → the shed's se → mode at peakStart → null
     const takeBase = takeTemp ? (isNum(takeTemp.bs) ? takeTemp.bs : takeTemp.fr) : null
     let season = null
-    if (pePre?.se === 'heating' || pePre?.se === 'cooling') season = pePre.se
+    if (SEASONS3.has(pePre?.se)) season = pePre.se
     else if (takeTemp && isNum(takeBase) && isNum(takeTemp.to) && Number(takeTemp.to) !== Number(takeBase)) {
       season = Number(takeTemp.to) > Number(takeBase) ? 'heating' : 'cooling'
-    } else if (peShed?.se === 'heating' || peShed?.se === 'cooling') season = peShed.se
+    } else if (SEASONS3.has(peShed?.se)) season = peShed.se
     else {
       const b = bucketAt(B, ps)
-      season = seasonOfMode(b ? b.m : prevTail?.mode)
+      season = seasonOfM(b ? b.m : prevTail?.mode)
     }
     const s = seasonSign(season)
 
@@ -614,16 +636,25 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
     const preStart = pePre ? Number(pePre.t) : null
 
     let offAt = null
+    let shedSp = null // a setback's setpoint (the verified shed temp write's)
+    const exitShed = findMarker(M, (a) => a.ty === 'phase_exit' && a.ph === 'shed')
     if (status === 'was_off') offAt = ps
-    else if (!boundary) {
+    else if (!boundary && setback) {
+      // A §4.6 (G): a setback sheds the setpoint — offAt = the scheduler's verified shed temp write
+      const w = findMarker(M, (a) => a.ty === 'write' && a.f === 'temp' && a.ac === 'scheduler' && a.res === 'verified' && Number(a.t) >= ps && Number(a.t) < (exitShed ? Number(exitShed.t) : pe))
+      offAt = w ? Number(w.t) : null
+      shedSp = w && isNum(w.to) ? Number(w.to) : null
+    } else if (!boundary) {
       const w = findMarker(M, (a) => a.ty === 'write' && a.f === 'power' && up(a.to) === 'OFF' && (a.fr == null || up(a.fr) === 'ON') && a.ac === 'scheduler' && a.res === 'verified')
       offAt = w ? Number(w.t) : null
     }
-    // (never a precondition's own power ON from an entry, addendum B F3.11: a restore ON comes after the shed began)
-    const onWrite = findMarker(M, (a) => a.ty === 'write' && a.f === 'power' && up(a.to) === 'ON' && a.ac === 'scheduler' && a.res === 'verified' && a.t >= (offAt ?? ps))
-    const exitShed = findMarker(M, (a) => a.ty === 'phase_exit' && a.ph === 'shed')
+    // (never a precondition's own power ON from an entry, addendum B F3.11: a restore ON comes after the shed began) — a
+    // setback's recovery starts at its verified RETURN temp write (after the shed's exit)
+    const onWrite = setback
+      ? (offAt != null && exitShed ? findMarker(M, (a) => a.ty === 'write' && a.f === 'temp' && a.ac === 'scheduler' && a.res === 'verified' && Number(a.t) >= Number(exitShed.t)) : null)
+      : findMarker(M, (a) => a.ty === 'write' && a.f === 'power' && up(a.to) === 'ON' && a.ac === 'scheduler' && a.res === 'verified' && a.t >= (offAt ?? ps))
     let shedEnd = pe
-    for (const c of [released?.t, onWrite?.t, exitShed?.t]) if (isNum(c) && Number(c) < shedEnd) shedEnd = Number(c)
+    for (const c of [released?.t, setback ? null : onWrite?.t, exitShed?.t]) if (isNum(c) && Number(c) < shedEnd) shedEnd = Number(c)
     if (offAt != null && shedEnd < offAt) shedEnd = offAt
     let onAt = onWrite ? Number(onWrite.t) : null
     if (onAt == null && !boundary && rel && rel.f === 'power' && up(rel.to) === 'ON') onAt = Number(rel.t)
@@ -676,8 +707,14 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
     let shed = null
     let flags = { flat: false, jump: false }
     if (offAt != null) {
-      const comfortPts = B.filter((b) => b.on === 0 && hasRoom(b) && inWin(b.t, offAt, shedEnd))
-      const driftPts = comfortPts.filter((b) => b.cv >= 120 && b.t >= offAt + SETTLE)
+      // a setback unit stays ON: every bucket with a reading is a comfort point; the drift runs while the heater is quiet
+      // (the reading above the setback + 1 °F) and ends at the first bucket at or below it
+      const comfortPts = B.filter((b) => (setback || b.on === 0) && hasRoom(b) && inWin(b.t, offAt, shedEnd))
+      let driftPts = comfortPts.filter((b) => b.cv >= 120 && b.t >= offAt + SETTLE)
+      if (setback && shedSp != null) {
+        const stop = comfortPts.find((b) => s * (b.r - (shedSp + 1)) <= 1e-9)
+        driftPts = driftPts.filter((b) => stop == null || b.t < stop.t)
+      }
       const winMin = (shedEnd - offAt) / 60
       const cov = winMin > 0 ? Math.min(1, (5 * comfortPts.length) / winMin) : 0
       const rBar = mean(comfortPts.map((b) => b.r))
@@ -688,7 +725,8 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
       const Tout = oWin.length ? mean(oWin.map((o) => Number(o.f))) : null
       flags = sensorFlags(driftPts, Tout, onAt, B, { offAt, shedEnd, offPoints: comfortPts })
       const drift = driftFit(driftPts, offAt, { end: shedEnd, flat: flags.flat })
-      const cls = classify(comfortPts, bnd, season, marginF, comfyMarginF, cov)
+      const floorF = setback && isNum(rules?.floorF) ? Number(rules.floorF) : null // the tank's comfortMinF (a reading floor)
+      const cls = classify(comfortPts, floorF != null ? { L: floorF, H: Infinity } : bnd, season, marginF, comfyMarginF, cov)
       // violations also count the fan-only buckets (the compressor is off there too, §0.5); the class, margin and
       // coverage stay on the OFF window, whose physics the evidence is about
       const fanPts = fanOnly ? B.filter((b) => hasRoom(b) && inWin(b.t, fanOnly.from, fanOnly.until) && !inIntervals(forced, b.t)) : []
@@ -702,6 +740,20 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
         gap: rBar != null && Tout != null ? round1(rBar - Tout) : null,
         x: rBar != null && Tout != null && season ? round1(s * (Tout - rBar)) : null,
         filled, flat: flags.flat, jump: flags.jump,
+      }
+      if (setback) {
+        // G1.11 evidence: minutes at or below the floor (the tank's comfortMinF, a room's band floor), at the hot-water
+        // level 'low', and with the heater running (a host's rn seconds) — over the whole setback window
+        const L = floorF ?? bnd.L
+        const win = B.filter((b) => inWin(b.t, offAt, shedEnd))
+        const hasRn = win.some((b) => b.rn != null)
+        Object.assign(shed, {
+          sp: shedSp,
+          floorMin: 5 * comfortPts.filter((b) => s > 0 ? b.r <= L + 1e-9 : b.r >= bnd.H - 1e-9).length,
+          lowMin: 5 * win.filter((b) => b.hw === 'low').length,
+          ranMin: hasRn ? round1(win.reduce((m, b) => m + (b.rn ?? 0), 0) / 60) : null,
+          levels: win.some((b) => b.hw != null) ? { first: win.find((b) => b.hw != null).hw, last: win.filter((b) => b.hw != null).at(-1).hw } : null,
+        })
       }
     }
 
@@ -789,11 +841,14 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
       const a = nominalStart(cfg, tz, e, ps, pe, preStart, season)
       for (const x of away) if (x.from < (boundary ? ps : pe) && x.until >= a) awayMode = x.mode
     }
-    const q = dryRun || status === 'dry' ? 'dry' : forcedQ ? 'forced' : awayMode ? 'away' : boundary ? 'pre_only' : !shed || shed.cov < 0.6 ? 'low_coverage' : shed.flat ? 'flat' : shed.jump ? 'jump' : 'ok'
+    // G1.11: a setback unit with neither a reading nor a hot-water level in the event's window is no evidence at all
+    const noSensor = setback && !B.some((b) => inWin(b.t, preStart ?? ps, pe) && (hasRoom(b) || b.hw != null))
+    const lowCov = !shed || (shed.cov < 0.6 && !(setback && shed.levels))
+    const q = dryRun || status === 'dry' ? 'dry' : forcedQ ? 'forced' : awayMode ? 'away' : boundary ? 'pre_only' : noSensor ? 'no_sensor' : lowCov ? 'low_coverage' : shed.flat ? 'flat' : shed.jump ? 'jump' : 'ok'
     out.push({
       ev: e.id, date: date ?? (typeof e.id === 'string' ? e.id.split('@')[0] : null), unit: unitId ?? null,
       kind: boundary ? 'boundary' : 'peak', peakStart: ps, peakEnd: pe, precondition: !!e.precondition, preStart,
-      status, season, par, dryRun, preSkipped: preNotice ? String(preNotice.rs ?? preNotice.why) : null,
+      status, season, ...(setback ? { shedKind: 'setback' } : {}), par, dryRun, preSkipped: preNotice ? String(preNotice.rs ?? preNotice.why) : null,
       conditioned: preNotice?.rs === 'already conditioned' ? { keeps: isNum(preNotice.to) ? Number(preNotice.to) : null, target: isNum(preNotice.fr) ? Number(preNotice.fr) : null } : null,
       preFromOff, ...(replanned ? { replanned: true } : {}), ...(awayMode ? { away: awayMode } : {}),
       pre, shed, fanOnly, rec,
@@ -838,7 +893,7 @@ function extMinutes(episodes, tz) {
 const JOB_TYPES = { write: 'Write', retry: 'Retry', failing: 'Failing', blocked: 'Blocked', verify_fail: 'Not applied', recovered: 'Recovered' }
 
 /** One unit's rollup for the day → {rollup: UnitRollup, tail: Tail|null}. */
-function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayMinutes, band, cfg, tz, prevTail, outdoor, date, masterS = null, constraint: c = NO_CONSTRAINT, marks = [] }) {
+function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayMinutes, band, cfg, tz, prevTail, outdoor, date, masterS = null, constraint: c = NO_CONSTRAINT, marks = [], rules = null }) {
   const B = normBuckets(S)
   // Addendum H: the unit's away intervals (the house modes' m records, continued from prevTail.away)
   const W = awayIntervals(marks, id, prevTail, t0, t0 + dayMinutes * 60)
@@ -866,6 +921,8 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
   const forcedFan = emptyTiers()
   const standby = emptyTiers()
   const off = emptyTiers()
+  const run = emptyTiers() // a host's running seconds (rn): a water heater heating (G §3.2)
+  let anyRn = false
   const cvT = emptyTiers()
   const roomT = { peak: [], off_peak: [], super_off_peak: [] }
   const modeMin = {}
@@ -883,6 +940,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
     else on[tier] += b.on / 60
     if (b.p === 1 && inIntervals(F.intervals, b.t)) (isFan ? forcedFan : forcedT)[tier] += b.on / 60
     off[tier] += (b.cv - b.on) / 60
+    if (b.rn != null) { run[tier] += b.rn / 60; anyRn = true }
     cvT[tier] += b.cv / 60
     cvSum += b.cv
     if (b.on > 0) {
@@ -914,7 +972,12 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
   const heat = modeMin.HEAT ?? 0
   const cool = (modeMin.COOL ?? 0) + (modeMin.DRY ?? 0)
   const onTotal = on.peak + on.off_peak + on.super_off_peak
-  const season = onTotal < 30 ? null : heat > onTotal / 2 ? 'heating' : cool > onTotal / 2 ? 'cooling' : null
+  let season = onTotal < 30 ? null : heat > onTotal / 2 ? 'heating' : cool > onTotal / 2 ? 'cooling' : null
+  if (typeof rules?.seasonOf === 'function') { // a host's unit kind (G: a Mysa 'heating', the water heater 'water')
+    const bySeason = {}
+    for (const [m, min] of Object.entries(modeMin)) { const se = rules.seasonOf(m); if (se) bySeason[se] = (bySeason[se] ?? 0) + min }
+    season = onTotal < 30 ? null : Object.keys(bySeason).find((se) => bySeason[se] > onTotal / 2) ?? null
+  }
 
   const changes = { schedule: 0, user: 0, system: 0, external: 0, gapped: 0, total: 0 }
   let userChanges = 0
@@ -966,7 +1029,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
   const marginF = isNum(cfg?.optimizer?.marginF) ? Number(cfg.optimizer.marginF) : 1
   const comfyMarginF = isNum(cfg?.optimizer?.comfyMarginF) ? Number(cfg.optimizer.comfyMarginF) : 2
   const extHistory = Array.isArray(prevTail?.ext) ? prevTail.ext : []
-  const episodes = buildEpisodes({ unitId: id, buckets: B, changes: C, markers: A, events: evs, band, outdoor, marginF, comfyMarginF, tz, extHistory, prevTail, date, forced: F.intervals, tierOf, away: awayL, cfg })
+  const episodes = buildEpisodes({ unitId: id, buckets: B, changes: C, markers: A, events: evs, band, outdoor, marginF, comfyMarginF, tz, extHistory, prevTail, date, forced: F.intervals, tierOf, away: awayL, cfg, rules })
 
   // shed-window band minutes (comfort points of participating episodes) — the report's bandPct basis; a peak while away
   // is never a comfort miss (Addendum H)
@@ -1005,6 +1068,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
     forcedFanMin: roundTiers(forcedFan),
     standbyMin: roundTiers(standby),
     offMin: roundTiers(off),
+    ...(anyRn ? { runMin: roundTiers(run) } : {}),
     unknownMin: roundTiers(unknown),
     modeMin: modeOut,
     season,
@@ -1055,9 +1119,11 @@ function orderedUnitIds(cfg, seen) {
  * @param {Array|null} [a.outdoorFill] hourly [{t (s), f}] (weather.hourlyFor(date)) for missing outdoor slots
  * @param {number|string|null} [a.builtAt]  stamped verbatim (ISO string; numbers are converted to ISO)
  * @param {object|null} [a.constraint]  the multi-split constraint {on, master, forcing, conflict} (see the header); null ⇒ none
+ * @param {Function|null} [a.unitRules]  (unitId) → the unit's kind rules {shed?: 'setback', seasonOf?(mode), floorF?} | null
+ *                                         (see the header: "Unit kinds")
  * @returns {Promise<object>} DailyRollup
  */
-export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdoorFill = null, builtAt = null, constraint = null }) {
+export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdoorFill = null, builtAt = null, constraint = null, unitRules = null }) {
   const startMs = tz.zonedToInstant(date, '00:00')
   const endMs = tz.zonedToInstant(addDays(date, 1), '00:00')
   const t0 = Math.round(startMs / 1000)
@@ -1120,6 +1186,7 @@ export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdo
       id, S: x.S, C: stable(x.C), A: stable(x.A), P: stable(x.P), nBoots: x.b, segs, tierMin, evs: evsMs, t0, dayMinutes,
       band: unitBand(cfg, id), cfg, tz, prevTail: prevTail?.[id] ?? null, outdoor: od.samples, date,
       masterS: masterId != null && masterId !== id ? per.get(masterId)?.S ?? [] : null, constraint: sys, marks: stable(marks),
+      rules: typeof unitRules === 'function' ? unitRules(id) ?? null : null,
     })
     units[id] = u.rollup
     tail[id] = u.tail

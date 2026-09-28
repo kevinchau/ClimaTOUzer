@@ -10,7 +10,7 @@
 //   makeTz(timezone) → the DST-safe clock arithmetic every other call takes as `tz` (tz.js)
 //   effectivePrecondition(cfg, unitCfg, unitState, season) → the Δ/lead a unit pre-conditions with (tuning.js)
 //   seasonOf(mode) → 'heating' | 'cooling' | null (tuning.js)
-//   rollupDay({date, records, cfg, tz, prevTail?, outdoorFill?, builtAt?, constraint?}) → DailyRollup (rollup.js)
+//   rollupDay({date, records, cfg, tz, prevTail?, outdoorFill?, builtAt?, constraint?, unitRules?}) → DailyRollup (rollup.js)
 //   fitDriftModel(episodes) → the drift model of a unit's shed windows (optimizer.js)
 //   proposeFor(ctx) → one guarded tuning proposal (or a hold) per unit and analysis date (optimizer.js)
 //   rationale(rule, evidence, names?, tz?) → the one-sentence explanation of a change (explain.js)

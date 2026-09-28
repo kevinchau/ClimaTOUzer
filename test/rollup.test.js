@@ -1487,3 +1487,91 @@ test('Addendum H: an m record without a mode or a unit list is a bad line; Stand
     assert.ok(!('m' in x.counts))
   }
 })
+
+// ─────────────────────────────── reference-app Addendum G: the setback episode, the water season ───────────────────────────────
+
+const PARAMS_W = { season: 'water', deltaF: 15, leadMin: 180, clampF: { coolingMin: 65, heatingMax: 76 }, source: 'config' }
+const TANK_RULES = { shed: 'setback', seasonOf: (m) => (/^(OFF|VACATION)$/i.test(String(m)) ? null : 'water'), floorF: 105 }
+/** A tank morning (Addendum G §1.5 (a)): pre-heat 04:00 120 → 125, set back 07:00 → 115, back 10:00 → 120. */
+function tankMorning(D, { tank = (i) => 120 + Math.min(4, i * 0.1), shedTank = (i) => 124 - i * 0.2, hw = null, rn = (i) => 0, withLines = true } = {}) {
+  const ev = `${D}@07:00`
+  const u = 'water-heater'
+  const B = (from, to, fn) => buckets(D, from, to, fn).map((b) => ({ ...b, u, m: 'HEAT PUMP', f: null }))
+  const S = [
+    ...B('03:00', '04:00', () => ({ r: tank ? 120 : null, n: tank ? 15 : 0, sp: 120, rn: 0, ...(hw ? { hw: 'full' } : {}) })),
+    ...B('04:00', '07:00', (i) => ({ r: tank ? tank(i) : null, n: tank ? 15 : 0, sp: 125, rn: 300, ...(hw ? { hw: 'full' } : {}) })),
+    ...B('07:00', '10:00', (i) => ({ r: tank ? shedTank(i) : null, n: tank ? 15 : 0, sp: 115, rn: rn(i), ...(hw ? { hw: hw(i) } : {}) })),
+    ...B('10:00', '12:00', (i) => ({ r: tank ? Math.min(120, 117 + i * 0.2) : null, n: tank ? 15 : 0, sp: 120, rn: 300, ...(hw ? { hw: 'some' } : {}) })),
+  ]
+  const A = !withLines ? [] : lines(D, u, ev, [
+    ['04:00', 0, { type: 'phase_enter', phase: 'precondition', season: 'water', params: PARAMS_W }],
+    ['04:00', 0, { type: 'take', field: 'temp', original: 120, applied: 125, phase: 'precondition', season: 'water' }],
+    ['04:00', 5, { type: 'write', field: 'temp', from: 120, to: 125, kind: 'take', result: 'verified' }],
+    ['07:00', 0, { type: 'phase_enter', phase: 'shed', from: 'precondition', season: 'water', params: PARAMS_W }],
+    ['07:00', 0, { type: 'take', field: 'temp', original: 120, from: 125, applied: 115, phase: 'shed', reason: 'peak started' }],
+    ['07:00', 5, { type: 'write', field: 'temp', from: 125, to: 115, kind: 'take', result: 'verified' }],
+    ['10:00', 0, { type: 'phase_exit', phase: 'shed', reason: 'ended' }],
+    ['10:00', 5, { type: 'write', field: 'temp', from: 115, to: 120, kind: 'return', result: 'verified' }],
+    ['10:00', 5, { type: 'restored', fields: ['temp'] }],
+  ])
+  return [...S, ...A.map((a) => ({ ...a, u }))]
+}
+const tankCfg = () => cfgWith(['water-heater'])
+
+test('G setback episode (the tank): shedKind, season water, offAt = the verified shed temp write, comfort over the whole window, floorMin / ranMin, rec from the RETURN write', async () => {
+  const records = tankMorning(DAY)
+  const r = await rollupDay({ date: DAY, records, cfg: tankCfg(), tz, unitRules: (id) => (id === 'water-heater' ? TANK_RULES : null) })
+  const u = r.units['water-heater']
+  assert.equal(u.season, 'water', 'the kind\'s season of the day')
+  assert.deepEqual(u.runMin.total > 0, true)
+  const [am] = u.episodes
+  assert.equal(am.shedKind, 'setback')
+  assert.equal(am.season, 'water')
+  assert.equal(am.status, 'done')
+  assert.deepEqual(am.par, { deltaF: 15, leadMin: 180 })
+  assert.equal(am.pre.orig, 120)
+  assert.equal(am.pre.app, 125)
+  assert.equal(am.pre.capped, true, '125 is the scald ceiling: +5 of the Δ 15')
+  assert.equal(am.shed.offAt, at(DAY, '07:00', 5), 'the verified shed TEMP write')
+  assert.equal(am.shed.sp, 115)
+  assert.equal(am.shed.end, at(DAY, '10:00'))
+  assert.equal(am.shed.floorMin, 0, 'the tank never fell to comfortMinF 105')
+  assert.equal(am.shed.lowMin, 0)
+  assert.equal(am.shed.ranMin, 0, 'the heater stayed quiet through the peak')
+  assert.ok(am.shed.cov >= 0.95, 'every bucket with a reading (the unit stays ON)')
+  assert.equal(am.rec.onAt, at(DAY, '10:00', 5), 'the verified RETURN temp write')
+  assert.equal(am.q, 'ok')
+  // a Daikin head's rollup is unchanged by the option (no rules ⇒ no key)
+  const plain = await rollupDay({ date: DAY, records, cfg: tankCfg(), tz })
+  assert.equal(plain.units['water-heater'].episodes[0].shedKind, undefined)
+})
+
+test('G setback evidence: a tank cycling 115 → 107 → 115 has floorMin 0 (its thermostat\'s restart point); 103 is a floorMin breach; the drift stops at the setback + 1', async () => {
+  const cycling = tankMorning(DAY, { shedTank: (i) => 115 - Math.abs(((i % 16) - 8)) })
+  const r = await rollupDay({ date: DAY, records: cycling, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })
+  const ep = r.units['water-heater'].episodes[0]
+  assert.equal(ep.shed.Tmin, 107)
+  assert.equal(ep.shed.floorMin, 0)
+  const cold = tankMorning(DAY, { shedTank: (i) => Math.max(103, 124 - i) })
+  const c = (await rollupDay({ date: DAY, records: cold, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })).units['water-heater'].episodes[0]
+  assert.ok(c.shed.floorMin > 0, `floorMin ${c.shed.floorMin}`)
+  assert.equal(c.shed.class, 'violated')
+  assert.ok(c.shed.drift == null || c.shed.drift.n <= 9, 'the drift fit ends at the first bucket at or below 116')
+})
+
+test('G setback without a tank reading: the hot-water level is the evidence (lowMin); neither reading nor level ⇒ q no_sensor', async () => {
+  const lv = tankMorning(DAY, { tank: null, hw: (i) => (i < 20 ? 'full' : i < 30 ? 'some' : 'low'), rn: (i) => (i >= 30 ? 300 : 0) })
+  const e = (await rollupDay({ date: DAY, records: lv, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })).units['water-heater'].episodes[0]
+  assert.equal(e.shed.lowMin, 30)
+  assert.equal(e.shed.ranMin, 30)
+  assert.deepEqual(e.shed.levels, { first: 'full', last: 'low' })
+  assert.equal(e.q, 'ok', 'a level counts for coverage')
+  const none = tankMorning(DAY, { tank: null })
+  const n = (await rollupDay({ date: DAY, records: none, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })).units['water-heater'].episodes[0]
+  assert.equal(n.q, 'no_sensor')
+})
+
+test('G classify accepts the water season (the heating direction)', () => {
+  assert.equal(classify([{ r: 104 }, { r: 104 }, { r: 110 }], { L: 105, H: Infinity }, 'water').class, 'violated')
+  assert.equal(classify([{ r: 112 }, { r: 111 }], { L: 105, H: Infinity }, 'water').class, 'comfortable')
+})

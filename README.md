@@ -288,7 +288,7 @@ Constants: `SEASONS` (the two room seasons), `WATER_SEASON`, `ALL_SEASONS`, `PAR
 
 | Function | Returns |
 |---|---|
-| `rollupDay({date, records, cfg, tz, prevTail?, outdoorFill?, builtAt?, constraint?})` | a Promise of the DailyRollup: per-unit minutes by tier, room, band, setpoint, changes, jobs, episodes, tail |
+| `rollupDay({date, records, cfg, tz, prevTail?, outdoorFill?, builtAt?, constraint?, unitRules?})` | a Promise of the DailyRollup: per-unit minutes by tier, room, band, setpoint, changes, jobs, episodes, tail |
 | `buildEpisodes({unitId, buckets, changes, markers, events, band, outdoor, tz, …})` | the episodes of one unit and day |
 | `classify(points, band, season, marginF?, comfyMarginF?, cov?)` | `{class, m, violMin, Tmin, Tmax}` |
 | `driftFit(points, offAt, opts?)` | `{b, a, n, se, r2, cov, dropped, ok}` or null |
