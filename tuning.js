@@ -31,6 +31,18 @@
 // ── Season (§5.3) ─────────────────────────────────────────────────────────────────────────────────
 // seasonOf(mode): HEAT ⇒ 'heating'; COOL, DRY ⇒ 'cooling'; anything else ⇒ null. Never the calendar.
 //
+// ── The water season (reference-app Addendum G G1.10, §2.2 §5.2) ──────────────────────────────────
+// A third season key 'water' (a hot-water tank: the host decides which units have it — the core never reads a unit
+// kind). effectivePrecondition(cfg, unitCfg, unitState, 'water') → base precondition.deltaF.water (15) / leadMin.water
+// (180); a tuned value is clamped to the WATER guardrails: deltaF ∈ [water.tune.minDeltaF 5, water.tune.maxDeltaF 25],
+// leadMin ∈ [optimizer.minLeadMin, 240]; earliestStart = water.earliestStart ('03:30'). guardrails(cfg, 'water') →
+// {minDeltaF, maxDeltaF, maxStepDeltaF: water.tune.stepDeltaF (5), earliestStart: water.earliestStart, peakStartMin: the
+// earliest peak of any event while water.preheatAllPeaks (default true), else the pre-conditioned ones, …}. The tuning
+// sub-object's `water` season is created on the first water mutation (emptyTuning keeps the two room seasons — nothing
+// changes for a room); normalizeTuning fills it when present; a whole-unit reset / suspend / resume includes it when
+// present. WATER_SEASON = 'water'; ALL_SEASONS = heating, cooling, water. gateOpen takes opts.seasons (default the two
+// room seasons) for a host whose unit has another; activeParams takes opts.seasonOf (default seasonOf).
+//
 // ── Apply gate (§5.10) ────────────────────────────────────────────────────────────────────────────
 // gateOpen({cfg, tz, unitCfg, unitState, now, effMax}) → {open, until, reason, eventId}
 //   open ⇔ auto.phase === 'idle' ∧ tou.activeEventFor(cfg, tz, unitCfg, now, effMax) == null.
@@ -98,6 +110,8 @@ import { addDays as addDaysStr, hhmmToMin, makeTz } from './tz.js'
 import { validateOptimizer } from './validate.js'
 
 export const SEASONS = ['heating', 'cooling']
+export const WATER_SEASON = 'water'
+export const ALL_SEASONS = ['heating', 'cooling', 'water']
 export const PARAMS = ['deltaF', 'leadMin']
 export const KINDS = ['change', 'revert', 'undo', 'reset', 'suspend', 'resume', 'cancel']
 export const REFUSALS = ['invalid', 'not_enabled', 'not_live', 'observe', 'locked', 'already', 'cooldown', 'frozen', 'guardrail', 'superseded', 'expired', 'state']
@@ -110,12 +124,23 @@ export const PRUNE_DAYS = 14
 const DAY_MS = 86400000
 const HARD_DELTA = [1, 6] // core validation range of precondition.deltaF
 const HARD_LEAD = [20, 240] // core validation range of precondition.leadMin
+const WATER_DEFAULTS = { deltaF: 15, leadMin: 180, minDeltaF: 5, maxDeltaF: 25, stepDeltaF: 5, earliestStart: '03:30' }
 const DEFAULTS = { deltaF: 3, leadMin: 120, coolingMin: 65, heatingMax: 76, minDeltaF: 1, maxDeltaF: 4, minLeadMin: 60, earliestStart: '04:30', maxStepDeltaF: 1, maxStepLeadMin: 30, observeDays: 3, revertCooldownDays: 3, mergeGapMin: 30, peakStartMin: 420 }
 
 function isNum(v) { return typeof v === 'number' && Number.isFinite(v) }
 function isObj(v) { return v !== null && typeof v === 'object' && !Array.isArray(v) }
 function numOr(v, d) { return isNum(v) ? v : d }
-function seasonKey(season) { return season === 'cooling' ? 'cooling' : 'heating' }
+function seasonKey(season) { return season === 'cooling' || season === 'water' ? season : 'heating' }
+function waterCfg(cfg) {
+  const w = isObj(cfg?.water) ? cfg.water : {}
+  const t = isObj(w.tune) ? w.tune : {}
+  return {
+    minDeltaF: numOr(t.minDeltaF, WATER_DEFAULTS.minDeltaF), maxDeltaF: numOr(t.maxDeltaF, WATER_DEFAULTS.maxDeltaF), stepDeltaF: numOr(t.stepDeltaF, WATER_DEFAULTS.stepDeltaF),
+    earliestStart: typeof w.earliestStart === 'string' ? w.earliestStart : WATER_DEFAULTS.earliestStart, allPeaks: w.preheatAllPeaks !== false,
+  }
+}
+/** The seasons a unit's tuning holds: the two room seasons, plus water once it exists. */
+function heldSeasons(t) { return isObj(t?.water) ? ALL_SEASONS : SEASONS }
 
 function pick(v, season) {
   if (v == null) return undefined
@@ -190,8 +215,9 @@ export function emptyTuning() {
 export function normalizeTuning(t) {
   if (!isObj(t)) return emptyTuning()
   const base = emptyTuning()
+  if (isObj(t.water)) base.water = emptySeason() // the water season, once a mutation created it
   for (const k of Object.keys(base)) {
-    if (SEASONS.includes(k)) {
+    if (ALL_SEASONS.includes(k)) {
       if (!isObj(t[k])) t[k] = base[k]
       else {
         const s = t[k]
@@ -214,7 +240,7 @@ export function normalizeTuning(t) {
  * Earliest peakStart (minutes after local midnight) of any precondition-flagged merged peak event in
  * the weekday or weekend/holiday table | null when no event pre-conditions.
  */
-export function preconditionPeakStartMin(cfg) {
+export function preconditionPeakStartMin(cfg, { allPeaks = false } = {}) {
   const gap = Math.max(0, numOr(cfg?.tou?.mergeGapMin, DEFAULTS.mergeGapMin))
   let best = null
   for (const key of ['weekday', 'weekendHoliday']) {
@@ -235,7 +261,7 @@ export function preconditionPeakStartMin(cfg) {
       cur = { ...p }
       evs.push(cur)
     }
-    for (const ev of evs) if (ev.pre && (best === null || ev.s < best)) best = ev.s
+    for (const ev of evs) if ((ev.pre || allPeaks) && (best === null || ev.s < best)) best = ev.s
   }
   return best
 }
@@ -245,19 +271,24 @@ export function preconditionPeakStartMin(cfg) {
  * {minDeltaF, maxDeltaF, minLeadMin, maxLeadMin, earliestStart, earliestStartMin, peakStartMin,
  *  maxStepDeltaF, maxStepLeadMin}. maxLeadMin = min(240, peakStartMin − earliestStartMin).
  */
-export function guardrails(cfg) {
+export function guardrails(cfg, season = null) {
   const opt = isObj(cfg?.optimizer) ? cfg.optimizer : {}
-  const maxDeltaF = Math.max(HARD_DELTA[0], Math.min(numOr(opt.maxDeltaF, DEFAULTS.maxDeltaF), HARD_DELTA[1]))
-  const minDeltaF = Math.min(Math.max(numOr(opt.minDeltaF, DEFAULTS.minDeltaF), HARD_DELTA[0]), maxDeltaF)
-  const earliestStart = typeof opt.earliestStart === 'string' ? opt.earliestStart : DEFAULTS.earliestStart
-  const earliestStartMin = safeMin(earliestStart, safeMin(DEFAULTS.earliestStart, 270))
-  const peakStartMin = preconditionPeakStartMin(cfg)
+  const w = season === WATER_SEASON ? waterCfg(cfg) : null
+  let maxDeltaF = Math.max(HARD_DELTA[0], Math.min(numOr(opt.maxDeltaF, DEFAULTS.maxDeltaF), HARD_DELTA[1]))
+  let minDeltaF = Math.min(Math.max(numOr(opt.minDeltaF, DEFAULTS.minDeltaF), HARD_DELTA[0]), maxDeltaF)
+  if (w) {
+    maxDeltaF = Math.max(1, w.maxDeltaF)
+    minDeltaF = Math.min(Math.max(1, w.minDeltaF), maxDeltaF)
+  }
+  const earliestStart = w ? w.earliestStart : typeof opt.earliestStart === 'string' ? opt.earliestStart : DEFAULTS.earliestStart
+  const earliestStartMin = safeMin(earliestStart, safeMin(w ? WATER_DEFAULTS.earliestStart : DEFAULTS.earliestStart, 270))
+  const peakStartMin = preconditionPeakStartMin(cfg, { allPeaks: !!w?.allPeaks })
   const minLeadMin = Math.max(HARD_LEAD[0], Math.min(numOr(opt.minLeadMin, DEFAULTS.minLeadMin), HARD_LEAD[1]))
   const room = (peakStartMin ?? DEFAULTS.peakStartMin) - earliestStartMin
   const maxLeadMin = Math.max(minLeadMin, Math.min(HARD_LEAD[1], room))
   return {
     minDeltaF, maxDeltaF, minLeadMin, maxLeadMin, earliestStart, earliestStartMin, peakStartMin,
-    maxStepDeltaF: Math.max(0, numOr(opt.maxStepDeltaF, DEFAULTS.maxStepDeltaF)),
+    maxStepDeltaF: w ? Math.max(1, w.stepDeltaF) : Math.max(0, numOr(opt.maxStepDeltaF, DEFAULTS.maxStepDeltaF)),
     maxStepLeadMin: Math.max(0, numOr(opt.maxStepLeadMin, DEFAULTS.maxStepLeadMin)),
   }
 }
@@ -266,31 +297,32 @@ export function guardrails(cfg) {
 
 /** §5.2 effective precondition params of one unit in `season` (see header). Pure; never throws. */
 export function effectivePrecondition(cfg, unitCfg, unitState, season) {
-  const valid = season === 'heating' || season === 'cooling'
+  const valid = season === 'heating' || season === 'cooling' || season === WATER_SEASON
   const s = seasonKey(season)
+  const w = s === WATER_SEASON ? waterCfg(cfg) : null
   const pc = isObj(cfg?.precondition) ? cfg.precondition : {}
   const opt = isObj(cfg?.optimizer) ? cfg.optimizer : {}
   const tuned = isObj(unitState?.tuning?.[s]) ? unitState.tuning[s] : null
   const tunedDelta = isNum(tuned?.deltaF) ? tuned.deltaF : null
   const tunedLead = isNum(tuned?.leadMin) ? tuned.leadMin : null
-  let deltaF = tunedDelta ?? numOr(pick(pc.deltaF, s), DEFAULTS.deltaF)
-  let leadMin = tunedLead ?? numOr(pick(pc.leadMin, s), DEFAULTS.leadMin)
+  let deltaF = tunedDelta ?? numOr(pick(pc.deltaF, s), w ? WATER_DEFAULTS.deltaF : DEFAULTS.deltaF)
+  let leadMin = tunedLead ?? numOr(pick(pc.leadMin, s), w ? WATER_DEFAULTS.leadMin : DEFAULTS.leadMin)
   const deltaSource = tunedDelta != null ? 'tuned' : 'config'
   const leadSource = tunedLead != null ? 'tuned' : 'config'
   const source = tunedDelta != null || tunedLead != null ? 'tuned' : 'config'
   let clampedBy = null
   if (tunedDelta != null) {
-    const hi = Math.min(numOr(opt.maxDeltaF, DEFAULTS.maxDeltaF), HARD_DELTA[1])
-    const lo = numOr(opt.minDeltaF, DEFAULTS.minDeltaF)
+    const hi = w ? w.maxDeltaF : Math.min(numOr(opt.maxDeltaF, DEFAULTS.maxDeltaF), HARD_DELTA[1])
+    const lo = w ? w.minDeltaF : numOr(opt.minDeltaF, DEFAULTS.minDeltaF)
     if (deltaF > hi) { deltaF = hi; clampedBy = 'maxDeltaF' } else if (deltaF < lo) { deltaF = lo; clampedBy = 'minDeltaF' }
   }
   if (tunedLead != null) {
     const lo = numOr(opt.minLeadMin, DEFAULTS.minLeadMin)
     if (leadMin < lo) { leadMin = lo; clampedBy = clampedBy ?? 'minLeadMin' } else if (leadMin > HARD_LEAD[1]) leadMin = HARD_LEAD[1]
   }
-  const earliestStart = typeof opt.earliestStart === 'string' ? opt.earliestStart : DEFAULTS.earliestStart
+  const earliestStart = w ? w.earliestStart : typeof opt.earliestStart === 'string' ? opt.earliestStart : DEFAULTS.earliestStart
   if (leadSource === 'tuned' && clampedBy === null) {
-    const peak = preconditionPeakStartMin(cfg)
+    const peak = preconditionPeakStartMin(cfg, { allPeaks: !!w?.allPeaks })
     const earliest = safeMin(earliestStart, null)
     if (peak != null && earliest != null && peak - leadMin < earliest) clampedBy = 'earliestStart'
   }
@@ -350,10 +382,10 @@ export function optimumLead({ season, room, target, rateFph, capMin, baseLeadMin
  * Params in force for a unit: the frozen `auto.params` while it owns an event (phase ≠ idle), else the
  * effective params for the season of the last valid read (fallback heating, H5).
  */
-export function activeParams(cfg, unitCfg, unitState, live) {
+export function activeParams(cfg, unitCfg, unitState, live, { seasonOf: seasonFn = seasonOf } = {}) {
   const auto = unitState?.auto
   if (auto && auto.phase && auto.phase !== 'idle' && isObj(auto.params)) return auto.params
-  const e = effectivePrecondition(cfg, unitCfg, unitState, seasonOf(live?.mode) ?? 'heating')
+  const e = effectivePrecondition(cfg, unitCfg, unitState, seasonFn(live?.mode) ?? 'heating')
   return e
 }
 
@@ -370,10 +402,10 @@ export function dirOf(from, to) {
   return to > from ? 'up' : 'down'
 }
 
-/** Seasons a mutation touches: its `seasons` list (multi-season base reset), else [season], else both. */
+/** Seasons a mutation touches: its `seasons` list (multi-season base reset), else [season] (water too), else both room seasons. */
 export function mutationSeasons(m) {
   if (Array.isArray(m?.seasons)) return m.seasons
-  return SEASONS.includes(m?.season) ? [m.season] : SEASONS
+  return ALL_SEASONS.includes(m?.season) ? [m.season] : SEASONS
 }
 
 // ---- dates ---------------------------------------------------------------------------------------
@@ -428,7 +460,7 @@ function eventEnd(cfg, tz, eventId) {
 }
 
 /** §5.10 gate: {open, until, reason:null|'owned'|'precondition'|'shed', eventId}. */
-export function gateOpen({ cfg, tz, unitCfg, unitState, now, effMax } = {}) {
+export function gateOpen({ cfg, tz, unitCfg, unitState, now, effMax, seasons = SEASONS } = {}) {
   const z = tzFor(cfg, tz)
   const ms = toMs(now)
   const auto = unitState?.auto
@@ -437,7 +469,7 @@ export function gateOpen({ cfg, tz, unitCfg, unitState, now, effMax } = {}) {
     const end = eventEnd(cfg, z, auto?.eventId)
     return { open: false, until: end != null && end > ms ? end : null, reason: 'owned', eventId: auto?.eventId ?? null }
   }
-  const effs = effMax ? [effMax] : SEASONS.map((s) => effectivePrecondition(cfg, unitCfg, unitState, s))
+  const effs = effMax ? [effMax] : seasons.map((s) => effectivePrecondition(cfg, unitCfg, unitState, s))
   let hit = null
   for (const e of effs) {
     const a = activeEventFor(cfg, z, unitCfg ?? null, ms, { ...e, suspended: false })
@@ -459,13 +491,13 @@ function malformed(m) {
   if (!isObj(m) || !KINDS.includes(m.kind)) return true
   switch (m.kind) {
     case 'change':
-      return !SEASONS.includes(m.season) || !PARAMS.includes(m.param) || !isNum(m.from) || !isNum(m.to) || m.from === m.to
+      return !ALL_SEASONS.includes(m.season) || !PARAMS.includes(m.param) || !isNum(m.from) || !isNum(m.to) || m.from === m.to
     case 'revert':
     case 'undo':
       return m.id == null
     case 'reset':
-      return (m.season != null && !SEASONS.includes(m.season)) ||
-        (m.seasons != null && (!Array.isArray(m.seasons) || !m.seasons.length || m.seasons.some((s) => !SEASONS.includes(s))))
+      return (m.season != null && !ALL_SEASONS.includes(m.season)) ||
+        (m.seasons != null && (!Array.isArray(m.seasons) || !m.seasons.length || m.seasons.some((s) => !ALL_SEASONS.includes(s))))
     case 'cancel':
       return m.id == null
     default:
@@ -501,7 +533,7 @@ export function check(unitState, mutation, ctx = {}) {
       if (cd && applyDate && applyDate < cd) return 'cooldown'
       const fr = t.frozen?.[`${m.season}.${dir}`]
       if (fr && applyDate && applyDate < fr) return 'frozen'
-      const g = guardrails(cfg)
+      const g = guardrails(cfg, m.season)
       const step = Math.abs(m.to - m.from)
       if (m.param === 'deltaF' && (m.to < g.minDeltaF || m.to > g.maxDeltaF || step > Math.max(g.maxStepDeltaF, 1) + 1e-9)) return 'guardrail'
       if (m.param === 'leadMin' && (m.to < g.minLeadMin || m.to > g.maxLeadMin || m.to % 5 !== 0 || step > g.maxStepLeadMin)) return 'guardrail'
@@ -545,7 +577,7 @@ export function check(unitState, mutation, ctx = {}) {
 }
 
 function findSeasonOfChange(t, id) {
-  for (const s of SEASONS) if (Array.isArray(t?.[s]?.history) && t[s].history.some((h) => h && h.id === id)) return s
+  for (const s of ALL_SEASONS) if (Array.isArray(t?.[s]?.history) && t[s].history.some((h) => h && h.id === id)) return s
   return null
 }
 
@@ -563,8 +595,9 @@ function bump(t, seasons, at) {
 export function applyMutation(tuning, mutation, now, ctx = {}) {
   if (!isObj(tuning)) throw new TypeError('applyMutation: tuning must be an object')
   if (malformed(mutation)) throw new TypeError(`applyMutation: malformed mutation ${JSON.stringify(mutation?.kind ?? null)}`)
-  const t = normalizeTuning(tuning)
   const m = mutation
+  if ((m.season === WATER_SEASON || (Array.isArray(m.seasons) && m.seasons.includes(WATER_SEASON))) && !isObj(tuning.water)) tuning.water = emptySeason()
+  const t = normalizeTuning(tuning)
   const ms = toMs(now)
   if (!Number.isFinite(ms)) throw new TypeError('applyMutation: now must be a time')
   const at = iso(ms)
@@ -670,7 +703,7 @@ export function applyMutation(tuning, mutation, now, ctx = {}) {
     }
 
     case 'reset': {
-      const seasons = mutationSeasons(m)
+      const seasons = m.season || m.seasons != null ? mutationSeasons(m) : heldSeasons(t)
       for (const s of seasons) {
         const st = t[s]
         st.deltaF = null
@@ -689,7 +722,7 @@ export function applyMutation(tuning, mutation, now, ctx = {}) {
 
     case 'suspend': {
       t.suspended = { since: m.since ?? m.applyDate ?? today, changeId: m.id ?? null }
-      bump(t, m.season ? [m.season] : SEASONS, at)
+      bump(t, m.season ? [m.season] : heldSeasons(t), at)
       Object.assign(summary, { param: 'suspended', from: false, to: true })
       clearPendingIfMine()
       return summary
@@ -697,7 +730,7 @@ export function applyMutation(tuning, mutation, now, ctx = {}) {
 
     case 'resume': {
       t.suspended = null
-      bump(t, m.season ? [m.season] : SEASONS, at)
+      bump(t, m.season ? [m.season] : heldSeasons(t), at)
       Object.assign(summary, { param: 'suspended', from: true, to: false })
       clearPendingIfMine()
       return summary
@@ -707,7 +740,7 @@ export function applyMutation(tuning, mutation, now, ctx = {}) {
       const p = t.pending
       if (!p || p.id !== m.id) return summary
       // the person's cancel is D's decision for the season (G6): a re-run over D must not re-issue it
-      const st = p.kind === 'change' && SEASONS.includes(p.season) ? t[p.season] : null
+      const st = p.kind === 'change' && ALL_SEASONS.includes(p.season) && isObj(t[p.season]) ? t[p.season] : null
       if (st && typeof p.analysisDate === 'string' && p.analysisDate && (typeof st.lastAnalysisDate !== 'string' || st.lastAnalysisDate < p.analysisDate)) st.lastAnalysisDate = p.analysisDate
       t.pending = null
       return summary

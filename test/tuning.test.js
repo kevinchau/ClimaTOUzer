@@ -14,6 +14,7 @@ import {
   seasonOf, emptyTuning, normalizeTuning, effectivePrecondition, snapshotParams, activeParams, currentValue,
   nextApplyDate, gateOpen, check, applyMutation, toPending, pruneTuning, validateTuningCfg, guardrails,
   preconditionPeakStartMin, observeInfo, dirOf, KINDS, REFUSALS, UNDO_WINDOW_MS, optimumLead,
+  SEASONS, WATER_SEASON, ALL_SEASONS, mutationSeasons,
 } from '../tuning.js'
 
 const SELF = fileURLToPath(import.meta.url)
@@ -1016,4 +1017,85 @@ test('toPending / pruneTuning / validateTuningCfg', () => {
   const paths = validateTuningCfg(bad).map((e) => e.path)
   assert.ok(paths.includes('optimizer.maxDeltaF'))
   assert.ok(paths.includes('optimizer.earliestStart'))
+})
+
+// ---- the water season (reference-app Addendum G G1.10, G1.12; §2.2 §5.2) ---------------------------------------
+
+const waterWorld = (patch) => world({
+  cfgPatch: (c) => {
+    c.precondition.deltaF.water = 15
+    c.precondition.leadMin.water = 180
+    c.water = { mixingValve: false, maxSetpointF: 140, minSetpointF: 110, comfortMinF: 105, differentialF: 8, preheatAllPeaks: true, earliestStart: '03:30', tune: { minDeltaF: 5, maxDeltaF: 25, stepDeltaF: 5 } }
+    patch?.(c)
+  },
+})
+
+test('water: the third season key — base Δ 15 / lead 180, the water guardrails, water.earliestStart; the room seasons untouched', () => {
+  assert.deepEqual(SEASONS, ['heating', 'cooling'])
+  assert.equal(WATER_SEASON, 'water')
+  assert.deepEqual(ALL_SEASONS, ['heating', 'cooling', 'water'])
+  const w = waterWorld()
+  const u = unitCfgOf(w.cfg)
+  const e = effectivePrecondition(w.cfg, u, w.office, 'water')
+  assert.deepEqual([e.season, e.deltaF, e.leadMin, e.earliestStart, e.source], ['water', 15, 180, '03:30', 'config'])
+  assert.deepEqual([effectivePrecondition(cfgDefault(), u, null, 'water').deltaF, effectivePrecondition(cfgDefault(), u, null, 'water').leadMin], [15, 180], 'defaults without the keys')
+  const h = effectivePrecondition(w.cfg, u, w.office, 'heating')
+  assert.deepEqual([h.season, h.deltaF, h.leadMin, h.earliestStart], ['heating', 3, 120, '04:30'])
+  // tuned values clamp to the WATER guardrails (Δ 5–25), never the rooms' 1–4
+  const t = { water: { deltaF: 30, leadMin: 300 } }
+  const us = { auto: { phase: 'idle' }, tuning: { ...emptyTuning(), water: { deltaF: 30, leadMin: 300, history: [] } } }
+  const hi = effectivePrecondition(w.cfg, u, us, 'water')
+  assert.deepEqual([hi.deltaF, hi.leadMin, hi.clampedBy], [25, 240, 'maxDeltaF'])
+  us.tuning.water = { deltaF: 2, leadMin: 150, history: [] }
+  const lo = effectivePrecondition(w.cfg, u, us, 'water')
+  assert.deepEqual([lo.deltaF, lo.clampedBy, lo.deltaSource], [5, 'minDeltaF', 'tuned'])
+  assert.ok(t)
+  // snapshotParams freezes the water season through the host's season
+  const sp = snapshotParams(w.cfg, u, w.office, 'Heat Pump', { season: 'water' })
+  assert.deepEqual([sp.season, sp.deltaF, sp.leadMin], ['water', 15, 180])
+  const ap = activeParams(w.cfg, u, w.office, { mode: 'HEAT PUMP' }, { seasonOf: () => 'water' })
+  assert.equal(ap.season, 'water')
+})
+
+test('water: guardrails(cfg, "water") — Δ 5–25 by 5, earliestStart 03:30, every peak pre-heats (the evening too)', () => {
+  const w = waterWorld()
+  const g = guardrails(w.cfg, 'water')
+  assert.deepEqual([g.minDeltaF, g.maxDeltaF, g.maxStepDeltaF, g.earliestStart, g.peakStartMin], [5, 25, 5, '03:30', 420])
+  assert.equal(g.maxLeadMin, 210, '07:00 − 03:30')
+  assert.deepEqual([guardrails(w.cfg).minDeltaF, guardrails(w.cfg).maxDeltaF, guardrails(w.cfg).earliestStart], [1, 4, '04:30'], 'the rooms unchanged')
+  const only17 = waterWorld((c) => { c.tou.weekday = c.tou.weekday.filter((r) => r.start !== '07:00') })
+  assert.equal(guardrails(only17.cfg, 'water').peakStartMin, 17 * 60, 'preheatAllPeaks: the evening peak counts')
+  assert.equal(preconditionPeakStartMin(only17.cfg), null, 'no flagged peak for the rooms')
+  assert.equal(preconditionPeakStartMin(only17.cfg, { allPeaks: true }), 17 * 60)
+})
+
+test('water: check / applyMutation — a +5 step is ok, +10 is a guardrail; the water season is created on the first mutation; a whole-unit reset clears it', () => {
+  const now = L(WED, '01:30')
+  const w = waterWorld()
+  const m = change({ season: 'water', from: 15, to: 20 })
+  assert.equal(check(w.state.units.office, m, { cfg: w.cfg, state: w.state, now, tz }), 'ok')
+  assert.equal(check(w.state.units.office, change({ season: 'water', from: 15, to: 25 }), { cfg: w.cfg, state: w.state, now, tz }), 'guardrail', 'one step is 5')
+  assert.equal(check(w.state.units.office, change({ season: 'water', from: 15, to: 30 }), { cfg: w.cfg, state: w.state, now, tz }), 'guardrail')
+  assert.equal(check(w.state.units.office, change({ season: 'water', from: 14, to: 19 }), { cfg: w.cfg, state: w.state, now, tz }), 'superseded')
+  assert.equal(emptyTuning().water, undefined, 'a room never carries the water key')
+  const tn = w.state.units.office.tuning
+  applyMutation(tn, m, now, { cfg: w.cfg, tz })
+  assert.equal(tn.water.deltaF, 20)
+  assert.equal(tn.water.history[0].to, 20)
+  assert.equal(effectivePrecondition(w.cfg, unitCfgOf(w.cfg), w.state.units.office, 'water').deltaF, 20)
+  assert.deepEqual(mutationSeasons({ kind: 'reset', season: 'water' }), ['water'])
+  normalizeTuning(tn)
+  assert.equal(tn.water.deltaF, 20, 'normalize keeps it')
+  applyMutation(tn, { kind: 'reset', id: 'r1' }, now, { cfg: w.cfg, tz })
+  assert.equal(tn.water.deltaF, null, 'a whole-unit reset clears the water season too')
+  assert.equal(check(w.state.units.office, { kind: 'reset', season: 'water' }, { cfg: w.cfg, state: w.state, now, tz }), 'ok')
+})
+
+test('water: gateOpen takes the host\'s seasons — a tank closes the gate from 04:00 (lead 180)', () => {
+  const w = waterWorld()
+  const u = unitCfgOf(w.cfg)
+  const at = L(WED, '04:10')
+  assert.equal(gateOpen({ cfg: w.cfg, tz, unitCfg: u, unitState: w.office, now: at }).open, true, 'the rooms: 05:00')
+  const g = gateOpen({ cfg: w.cfg, tz, unitCfg: u, unitState: w.office, now: at, seasons: ['water'] })
+  assert.deepEqual([g.open, g.reason], [false, 'precondition'])
 })

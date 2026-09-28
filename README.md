@@ -263,16 +263,16 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | Function | Returns |
 |---|---|
 | `seasonOf(mode)` | `'heating'` (HEAT), `'cooling'` (COOL, DRY) or null |
-| `effectivePrecondition(cfg, unitCfg, unitState, season)` | `{season, deltaF, leadMin, clampF, earliestStart, suspended, source, deltaSource, leadSource, clampedBy}` |
+| `effectivePrecondition(cfg, unitCfg, unitState, season)` | `{season, deltaF, leadMin, clampF, earliestStart, suspended, source, deltaSource, leadSource, clampedBy}`; `season` may be `'water'` (a hot-water tank: base `precondition.deltaF.water`/`leadMin.water`, guardrails `water.tune`, `water.earliestStart`) |
 | `snapshotParams(cfg, unitCfg, unitState, mode, opts?)` | the parameters to freeze when a run starts |
-| `activeParams(cfg, unitCfg, unitState, live)` | the frozen parameters while engaged, else the effective ones |
+| `activeParams(cfg, unitCfg, unitState, live, {seasonOf}?)` | the frozen parameters while engaged, else the effective ones (the host's `seasonOf` for a unit of another kind) |
 | `currentValue(cfg, unitCfg, unitState, season, param)` | the current effective `deltaF`, `leadMin` or `suspended` |
-| `guardrails(cfg)` | `{minDeltaF, maxDeltaF, minLeadMin, maxLeadMin, earliestStart, …}` with defaults applied |
-| `preconditionPeakStartMin(cfg)` | the earliest pre-conditioned peak start in minutes, or null |
+| `guardrails(cfg, season?)` | `{minDeltaF, maxDeltaF, minLeadMin, maxLeadMin, earliestStart, …}` with defaults applied (`'water'`: the tank's) |
+| `preconditionPeakStartMin(cfg, {allPeaks}?)` | the earliest pre-conditioned peak start in minutes (any peak with `allPeaks`), or null |
 | `optimumLead({season, room, target, rateFph, capMin, baseLeadMin})` | `{leadMin, source, need}`: how early to start a unit that is off |
 | `nextApplyDate(cfg, tz, now)` | the first local date a change made now can affect |
 | `observeInfo({cfg, state, unitState, tz, now, applyDate})` | `{enabledAt, liveFrom, applyDate, observe, daysLeft}` |
-| `gateOpen({cfg, tz, unitCfg, unitState, now, effMax})` | `{open, until, reason, eventId}`: may a change apply now |
+| `gateOpen({cfg, tz, unitCfg, unitState, now, effMax, seasons?})` | `{open, until, reason, eventId}`: may a change apply now |
 | `check(unitState, mutation, ctx)` | `'ok'` or a refusal code from `REFUSALS` |
 | `applyMutation(tuning, mutation, now, ctx?)` | applies a checked mutation in place, returns a summary |
 | `emptyTuning()`, `normalizeTuning(t)` | the per-unit tuning state |
@@ -281,7 +281,7 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `dirOf(from, to)`, `mutationSeasons(m)` | `'up'`, `'down'` or null; the seasons a mutation touches |
 | `validateTuningCfg(cfg)` | the optimizer section's errors |
 
-Constants: `SEASONS`, `PARAMS`, `KINDS`, `REFUSALS`, `UNDO_WINDOW_MS`, `HISTORY_MAX`, `REVERTS_MAX`, `FREEZE_DAYS`,
+Constants: `SEASONS` (the two room seasons), `WATER_SEASON`, `ALL_SEASONS`, `PARAMS`, `KINDS`, `REFUSALS`, `UNDO_WINDOW_MS`, `HISTORY_MAX`, `REVERTS_MAX`, `FREEZE_DAYS`,
 `PRUNE_DAYS`.
 
 **rollup**: daily rollups and episodes

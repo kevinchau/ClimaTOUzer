@@ -45,9 +45,12 @@
 //   heater pre-heats before every peak): the eff it returns (frozen params too) carries `precondition`, which
 //   preconditionWindow / activeEventFor / eventOverlapping read in place of event.precondition.
 //   plan opts.unitRules?(unitCfg) → {shed?: 'off' | 'setback', dryOut?: bool, preconditions?(event), preconditionMode?(mode),
-//   bumpLimits?(season, caps) → {floor, ceiling} | null} | null — absent ⇒ a Daikin head's (shed 'off', dry-out, the
-//   precondition.modes gate, clampF ∩ 61–90): PlanDay units[id].shed 'setback' for a setback unit (still 'opted out' |
-//   'skipped' | 'released' first), fanOnlyUntil / dryout / entryDryOut none without dry-out.
+//   bumpLimits?(season, caps) → {floor, ceiling} | null, modeText?(mode) → the device's own spelling of a mode} | null —
+//   absent ⇒ a Daikin head's (shed 'off', dry-out, the precondition.modes gate, clampF ∩ 61–90): PlanDay units[id].shed
+//   'setback' for a setback unit (still 'opted out' | 'skipped' | 'released' first), fanOnlyUntil / dryout / entryDryOut
+//   none without dry-out. The 'water' season's texts (a hot-water tank): "pre-heat tank +15° → 125° from 4:00" (Δ, the
+//   target, " (scald limit)" when the ceiling clamped it); with modeText, a mode outside the pre-heat modes reads "no
+//   pre-heat in Energy Saver" and one without a season "skip: mode Vacation".
 //   bumpTarget(original, season, deltaF, limits, step = 1, tol = 0.6) → {target, moves} — THE bump (the host's decide
 //   calls it with kinds.bumpLimits): heating / water ⇒ max(min(roundToStep(original + Δ), ceiling), floor); cooling ⇒
 //   min(max(roundToStep(original − Δ), floor), ceiling); moves = the target moves the intended way by more than tol;
@@ -678,26 +681,27 @@ export function entryEffFor(cfg, tz, unitCfg, unitState, liveMode, { effectivePr
 // Faithful copy of addendum §5.2 effectivePrecondition (used when tuning.js is not injected): per-parameter
 // provenance and read-time clamps of the TUNED parameter only, as tuning.js (addendum D X1.1, A-11).
 function fallbackEff(cfg, unitCfg, unitState, season) {
-  const s = season === 'cooling' ? 'cooling' : 'heating'
+  const s = season === 'cooling' || season === 'water' ? season : 'heating'
+  const w = s === 'water' ? { ...(cfg?.water ?? {}), tune: cfg?.water?.tune ?? {} } : null // the tank's (tuning.js)
   const pc = cfg?.precondition ?? {}
   const opt = cfg?.optimizer ?? {}
   const tuned = unitState?.tuning?.[s]
   const deltaSource = typeof tuned?.deltaF === 'number' ? 'tuned' : 'config'
   const leadSource = typeof tuned?.leadMin === 'number' ? 'tuned' : 'config'
-  let deltaF = deltaSource === 'tuned' ? tuned.deltaF : pick(pc.deltaF, s) ?? 3
-  let leadMin = leadSource === 'tuned' ? tuned.leadMin : pick(pc.leadMin, s) ?? 120
+  let deltaF = deltaSource === 'tuned' ? tuned.deltaF : pick(pc.deltaF, s) ?? (w ? 15 : 3)
+  let leadMin = leadSource === 'tuned' ? tuned.leadMin : pick(pc.leadMin, s) ?? (w ? 180 : 120)
   const source = deltaSource === 'tuned' || leadSource === 'tuned' ? 'tuned' : 'config'
   let clampedBy = null
   if (deltaSource === 'tuned') {
-    const lo = opt.minDeltaF ?? 1
-    const hi = Math.min(opt.maxDeltaF ?? 4, 6)
+    const lo = w ? w.tune.minDeltaF ?? 5 : opt.minDeltaF ?? 1
+    const hi = w ? w.tune.maxDeltaF ?? 25 : Math.min(opt.maxDeltaF ?? 4, 6)
     if (deltaF > hi) { deltaF = hi; clampedBy = 'maxDeltaF' } else if (deltaF < lo) { deltaF = lo; clampedBy = 'minDeltaF' }
   }
   if (leadSource === 'tuned') leadMin = clamp(leadMin, opt.minLeadMin ?? 60, 240)
   return {
     season, deltaF, leadMin,
     clampF: pc.clampF ?? { coolingMin: 65, heatingMax: 76 },
-    earliestStart: opt.earliestStart ?? '04:30',
+    earliestStart: w ? w.earliestStart ?? '03:30' : opt.earliestStart ?? '04:30',
     suspended: !!unitState?.tuning?.suspended,
     source, deltaSource, leadSource, clampedBy,
   }
@@ -824,7 +828,8 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   res.preStart = iso(win.preStart)
   res.source = eff?.source ?? 'config'
   const tail = ` from ${hmm(tz, win.preStart)}${res.source === 'tuned' ? ' · auto-tuned' : ''}`
-  const verbOf = (s) => (s === 'cooling' ? 'cool' : 'heat')
+  const verbOf = (s) => (s === 'cooling' ? 'cool' : s === 'water' ? 'pre-heat tank' : 'heat')
+  const modeText = typeof R0.modeText === 'function' ? (m) => R0.modeText(m) ?? m : null
   const modes = Array.isArray(cfg?.precondition?.modes) ? cfg.precondition.modes : ['COOL', 'DRY', 'HEAT']
   const preMode = typeof R0.preconditionMode === 'function' ? (m) => !!R0.preconditionMode(m) : (m) => modes.includes(m)
   const limitsOf = typeof R0.bumpLimits === 'function' ? (s, clampF) => R0.bumpLimits(s, live?.caps ?? null, clampF) : headLimits
@@ -835,7 +840,10 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
     const base = eOn && Number.isFinite(Number(sp)) ? Number(sp) : Number(owned.original)
     const d = Number(owned.applied) - base
     res.target = Number(owned.applied)
-    res.precondition = `${verbOf(season)} ${d < 0 ? MINUS : '+'}${fmtNum(Math.abs(d))}° → ${fmtNum(owned.applied)}°${tail}${sched}`
+    const dw = Number(eff?.deltaF)
+    res.precondition = season === 'water' && Number.isFinite(dw)
+      ? `${verbOf(season)} +${fmtNum(dw)}° → ${fmtNum(owned.applied)}°${tail}${sched}${d < dw - 1e-9 ? ' (scald limit)' : ''}`
+      : `${verbOf(season)} ${d < 0 ? MINUS : '+'}${fmtNum(Math.abs(d))}° → ${fmtNum(owned.applied)}°${tail}${sched}`
     return res
   }
   const deltaF = Number(eff?.deltaF ?? 3)
@@ -872,6 +880,8 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   if (!src) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
   if (String(src.power ?? '').toUpperCase() !== 'ON') { res.precondition = 'skip: unit off'; return res }
   const mode = String(src.mode ?? '').toUpperCase()
+  if (modeText && mode && !season) { res.precondition = `skip: mode ${modeText(mode)}`; return res }
+  if (modeText && mode && !preMode(mode)) { res.precondition = `no pre-heat in ${modeText(mode)}`; return res }
   if (!season || !preMode(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
   const original = Number(src.temp)
   if (!Number.isFinite(original)) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
@@ -879,6 +889,10 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   if (target == null) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
   if (!moves) { res.precondition = season === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
   res.target = target
+  if (season === 'water') { // the tank: its Δ and the target, and whether the ceiling (the scald limit) cut the bump
+    res.precondition = `${verbOf(season)} +${fmtNum(deltaF)}° → ${fmtNum(target)}°${tail}${target < original + deltaF - 1e-9 ? ' (scald limit)' : ''}`
+    return res
+  }
   res.precondition = `${verbOf(season)} ${season === 'cooling' ? MINUS : '+'}${fmtNum(Math.abs(target - original))}° → ${fmtNum(target)}°${tail}`
   return res
 }

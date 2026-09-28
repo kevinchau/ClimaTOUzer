@@ -1477,6 +1477,26 @@ test('G plan: a setback unit (a Mysa room) — shed \'setback\', no fan-only, no
   assert.equal(p.events[1].units.bathroom.precondition, 'off', 'the evening event does not pre-condition by default')
 })
 
+test('G2 plan: the water season — "pre-heat tank +15° → 125° from 4:00 (scald limit)", the Δ and lead from leadMin.water, modeText for the modes outside the pre-heat', () => {
+  const cfg = cfgDefault()
+  cfg.precondition.deltaF.water = 15
+  cfg.precondition.leadMin.water = 180
+  cfg.units.push({ id: 'water-heater', name: 'Water heater', kind: 'econet', order: 8, shed: true, precondition: true })
+  const MODES = ['Off', 'Energy Saver', 'Heat Pump', 'Vacation']
+  const text = (m) => MODES.find((x) => x.toUpperCase() === String(m).toUpperCase()) ?? null
+  const rules = (u) => (u.kind === 'econet' ? { shed: 'setback', dryOut: false, preconditions: () => true, preconditionMode: (m) => m === 'HEAT PUMP', bumpLimits: (s) => (s === 'water' ? { floor: 110, ceiling: 125 } : null), modeText: text } : null)
+  const seasonOfK = (m, u) => (u?.kind === 'econet' ? (/^(OFF|VACATION)$/i.test(String(m)) ? null : 'water') : seasonOf(m))
+  const at = (mode, temp = 120) => tou.plan(cfg, { units: {} }, tz, THU, { live: { 'water-heater': { power: mode === 'OFF' ? 'OFF' : 'ON', mode, temp, caps: {} } }, seasonOf: seasonOfK, unitRules: rules })
+  const p = at('HEAT PUMP')
+  assert.equal(p.events[0].units['water-heater'].precondition, 'pre-heat tank +15° → 125° from 4:00 (scald limit)')
+  assert.equal(p.events[1].units['water-heater'].precondition, 'pre-heat tank +15° → 125° from 14:00 (scald limit)', 'every peak (preheatAllPeaks), lead 180')
+  assert.equal(p.events[0].units['water-heater'].shed, 'setback')
+  assert.equal(at('HEAT PUMP', 105).events[0].units['water-heater'].precondition, 'pre-heat tank +15° → 120° from 4:00', 'not clamped: no suffix')
+  assert.equal(at('HEAT PUMP', 125).events[0].units['water-heater'].precondition, 'skip: already at ceiling')
+  assert.equal(at('ENERGY SAVER').events[0].units['water-heater'].precondition, 'no pre-heat in Energy Saver')
+  assert.equal(at('VACATION').events[0].units['water-heater'].precondition, 'skip: mode Vacation')
+})
+
 test('G entryEffFor preconditions(e): an event this unit pre-conditions though its flag is off (water.preheatAllPeaks) has a window, engaged too', () => {
   const cfg = cfgDefault()
   const u = cfg.units[0]
