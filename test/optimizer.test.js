@@ -1483,3 +1483,86 @@ describe('property: 2 000 seeded contexts (+ cooling mirror, + the weekend pre-c
     assert.ok(tally.R3 >= 20 && tally.veto >= 5, JSON.stringify(tally))
   })
 })
+
+// ───────────────────────────── reference-app Addendum G: the water season (a hot-water tank) ─────────────────────────────
+
+/** A tank episode (rollup's setback shape, season 'water'): pre-heated 120 → 125 (the scald ceiling), set back to 115. */
+function wEp(date, o = {}) {
+  const ps = tz.zonedToInstant(date, o.at ?? '07:00') / 1000
+  const pe = ps + 3 * 3600
+  const par = { deltaF: o.deltaF ?? 15, leadMin: o.leadMin ?? 180 }
+  const low = o.low === undefined ? 116 : o.low
+  return {
+    ev: `${date}@${o.at ?? '07:00'}`, date, unit: 'office', kind: 'peak', peakStart: ps, peakEnd: pe, precondition: o.precondition ?? true,
+    preStart: ps - par.leadMin * 60, status: o.status ?? 'done', season: 'water', shedKind: 'setback', par, dryRun: false, preSkipped: null, preFromOff: false,
+    pre: { orig: o.orig ?? 120, app: o.app ?? 125, dApp: 5, capped: o.capped ?? true, T0: 119, Tpk: 124, rise: 5, eff: 1, reached: o.reached ?? true, t90: 60, reachedMinBeforePeak: 0, leadUsed: par.leadMin },
+    shed: {
+      offAt: ps, end: pe, cov: low == null ? 0 : 0.95, rOff: 124, drift: null, driftFph: null, Tmin: low, Tmax: low == null ? null : 124,
+      m: low == null ? null : low - 105, violMin: 0, class: o.cls ?? (low == null ? 'unknown' : low <= 105 ? 'violated' : 'comfortable'), Tout: null, rBar: low == null ? null : 120, gap: null, x: null,
+      filled: false, flat: false, jump: false, sp: 115, floorMin: o.floorMin ?? 0, lowMin: o.lowMin ?? 0, ranMin: 0, levels: o.levels ?? null,
+    },
+    fanOnly: null, rec: null, released: null, overrides: [], forced: [], forcedBand: null, dryoutSkipped: null, jobs: { retries: 0, failing: 0, blocked: 0 }, q: o.q ?? 'ok',
+  }
+}
+const WATER = { mixingValve: false, maxSetpointF: 140, minSetpointF: 110, comfortMinF: 105, differentialF: 8, preheatAllPeaks: true, earliestStart: '03:30', tune: { minDeltaF: 5, maxDeltaF: 25, stepDeltaF: 5 } }
+function wCtx(eps, o = {}) {
+  const ctx = mkCtx('heating', {
+    ...o,
+    cfg: (c) => { c.water = { ...WATER, ...(o.water ?? {}) }; c.precondition.deltaF.water = o.deltaF ?? 15; c.precondition.leadMin.water = o.leadMin ?? 180 },
+  })
+  ctx.rollups = mkRollups('heating', eps)
+  return ctx
+}
+
+describe('the water season (Addendum G G1.11, G1.12)', () => {
+  test('detectSeason ⇒ water; R1 on floorMin: Δ +5 (15 → 20) when the ceiling leaves room; the change passes tuning.check', () => {
+    const ctx = wCtx([wEp(D, { orig: 105, app: 120, capped: false, low: 103, floorMin: 25 })])
+    assert.equal(O.detectSeason(ctx), 'water')
+    const r = O.proposeFor(ctx)
+    assert.deepEqual(decision(r), CHANGE('deltaF', 15, 20, 'R1_DELTA'), JSON.stringify(r.hold ?? r.change?.rationale))
+    assert.equal(r.model.kind, 'none', 'no drift model for a tank')
+    assert.equal(r.signals.R3, false)
+    assert.match(r.change.rationale, /^Office's tank dropped to 103° during Wed's morning peak \(floor 105°\)\. Pre-heat \+15° → \+20° from/)
+    assert.equal(tuning.check(ctx.unitState, r.change, { cfg: ctx.cfg, state: ctx.state, now: ctx.now, tz }), 'ok')
+  })
+
+  test('R1 on lowMin (no tank reading: the hot-water level is the evidence)', () => {
+    const ctx = wCtx([wEp(D, { orig: 105, app: 120, capped: false, low: null, lowMin: 20, levels: { first: 'full', last: 'low' } })])
+    assert.deepEqual(decision(O.proposeFor(ctx)), CHANGE('deltaF', 15, 20, 'R1_DELTA'))
+  })
+
+  test('J32: R1 never proposes Δ above ceilingF − median(original) — the lead grows instead, then at_limit with the scald-limit suggestion', () => {
+    const lead = O.proposeFor(wCtx([wEp(D, { low: 103, floorMin: 25, capped: false, app: 135 })], { leadMin: 180 }))
+    assert.deepEqual(decision(lead), CHANGE('leadMin', 180, 210, 'R1_LEAD'), '120 + 15 + 5 > 125: never Δ; the start moves to 3:30')
+    const r = O.proposeFor(wCtx([wEp(D, { low: 103, floorMin: 25, leadMin: 210 })], { leadMin: 210 }))
+    assert.deepEqual(decision(r), HOLD('at_limit'))
+    assert.match(r.hold.text, /At the 125° scald limit/)
+    assert.match(r.suggestion.text, /the 125° scald limit; tell the app if a mixing valve is installed/)
+    const valve = O.proposeFor({ ...wCtx([wEp(D, { low: 103, floorMin: 25, capped: false, app: 135, leadMin: 210 })], { leadMin: 210, water: { mixingValve: true } }), ceilingF: 140 })
+    assert.deepEqual(decision(valve), CHANGE('deltaF', 15, 20, 'R1_DELTA'), 'with the valve: 120 + 15 + 5 ≤ 140')
+  })
+
+  test('R2 after 3 comfortable peaks (never at the floor, never low): Δ −5; a tank cycling to its restart point is comfortable', () => {
+    const r = O.proposeFor(wCtx(WD.slice(0, 3).map((d) => wEp(d, { low: 118 }))))
+    assert.deepEqual(decision(r), CHANGE('deltaF', 15, 10, 'R2_DELTA'))
+    assert.match(r.change.rationale, /^Office's tank stayed ≥ 118° through the last 3 peaks\. Trying less pre-heat: \+15° → \+10°\./)
+    const lv = O.proposeFor(wCtx(WD.slice(0, 3).map((d) => wEp(d, { low: null, levels: { first: 'full', last: 'some' } }))))
+    assert.deepEqual(decision(lv), CHANGE('deltaF', 15, 10, 'R2_DELTA'), 'a level that never ran low')
+  })
+
+  test('the evening episode takes part (preheatAllPeaks: its event flag is false); no_sensor is never evidence — hold no_sensor', () => {
+    const r = O.proposeFor(wCtx([wEp(D, { at: '17:00', precondition: false, orig: 105, app: 120, capped: false, low: 103, floorMin: 25 })]))
+    assert.equal(decision(r).rule, 'R1_DELTA')
+    const n = O.proposeFor(wCtx([wEp(D, { low: null, q: 'no_sensor' })]))
+    assert.deepEqual(decision(n), HOLD('no_sensor'))
+    assert.equal(n.hold.text, "Office reports neither its tank temperature nor a hot-water level — auto-tune can't learn; pre-heat stays at +15° from 4:00")
+  })
+
+  test('fitDriftModel never fits a tank; clampStep keeps the water step and range', () => {
+    assert.equal(O.fitDriftModel([wEp(D)]).n, 0)
+    const g = tuning.guardrails({ water: WATER, tou: baseCfg().tou }, 'water')
+    assert.deepEqual(O.clampStep({ deltaF: 15 }, { param: 'deltaF', to: 20 }, g, 420), { param: 'deltaF', from: 15, to: 20 })
+    assert.deepEqual(O.clampStep({ deltaF: 25 }, { param: 'deltaF', to: 30 }, g, 420), null, 'the water max 25')
+    assert.deepEqual(O.clampStep({ deltaF: 15 }, { param: 'deltaF', to: 30 }, g, 420), { param: 'deltaF', from: 15, to: 20 }, 'one step of 5')
+  })
+})

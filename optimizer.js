@@ -103,6 +103,21 @@
 //     is a failing job); the forced_by_master hold judges the newest PEAK episode.
 //   • R3's forecast window is the apply date's first pre-conditioning PEAK — a boundary event has no peak hours.
 //
+// The water season (reference-app Addendum G G1.11, G1.12; a host's hot-water tank — the core knows no unit kind):
+//   • detectSeason returns 'water' for a unit whose latest participating episode says so (rollup's season 'water').
+//   • E: a tank pre-heats before every peak — its episode takes part when it has `par`, whatever the event's flag; an
+//     episode with q 'no_sensor' (neither a tank reading nor a hot-water level) is never E. With no fresh episode and
+//     the newest water episode 'no_sensor', the hold is 'no_sensor'.
+//   • No drift model (fitDriftModel fits heating / cooling only), so no R3 and no veto; the realisation reads the tank.
+//   • R1 on the breach evidence: shed.floorMin > 0 (at or below water.comfortMinF) or shed.lowMin > 0 (hot water
+//     'low'), or a comfort override during the shed; R2 after 3 comfortable peaks: floorMin 0, lowMin 0 and the class
+//     comfortable (or, with no reading, a level). The guardrails are tuning.guardrails(cfg, 'water') (Δ 5–25 by 5,
+//     water.earliestStart, every peak); stepFor steps Δ by water.tune.stepDeltaF and R1 never proposes Δ above
+//     ceilingF − median(original) (J32; ctx.ceilingF — input.ceilingF, the host's kinds.ceilingF, else
+//     min(water.maxSetpointF, 125 | 140 with water.mixingValve)); at the ceiling the hold is at_limit with the
+//     scald-limit suggestion. clampStep reads guardrails.season 'water': Δ ≤ min(30, maxDeltaF), a step ≤ its step.
+//   • The evidence band of a water change is [water.comfortMinF, ceilingF] ("floor 105°").
+//
 // ── User/system mutations as pure proposals (§5.10–§5.12) ────────────────────────────────────────
 // proposeRevert / proposeUndo / proposeCancel / proposeReset / baseResets build the mutation objects
 // insights.mutate() commits, with the CAS fields tuning.check() verifies, and pre-verify them with
@@ -117,7 +132,7 @@ import { median, mean, ols } from './stats.js'
 import { check as tuningCheck, currentValue, effectivePrecondition, emptyTuning, guardrails as tuningGuardrails, nextApplyDate, observeInfo, seasonOf, UNDO_WINDOW_MS } from './tuning.js'
 import * as T from './explain.js'
 
-export const HOLD_CODES = Object.freeze(['off', 'not_live', 'no_season', 'learning', 'forced_by_master', 'low_data', 'locked', 'already', 'tight', 'need_n', 'cooldown', 'hysteresis', 'veto', 'sensor', 'at_limit', 'frozen', 'suspended', 'guardrail'])
+export const HOLD_CODES = Object.freeze(['off', 'not_live', 'no_season', 'learning', 'forced_by_master', 'low_data', 'locked', 'already', 'tight', 'need_n', 'cooldown', 'hysteresis', 'veto', 'sensor', 'at_limit', 'frozen', 'suspended', 'guardrail', 'no_sensor'])
 export const RULES = Object.freeze(['R1_DELTA', 'R1_LEAD', 'R5', 'R3', 'R2_DELTA', 'R2_LEAD', 'R4A', 'R4B'])
 export const CHANGE_PARAMS = Object.freeze(['deltaF', 'leadMin', 'suspended'])
 
@@ -145,6 +160,7 @@ const R3_COLDER = 2 // °F colder than any handled fresh morning
 const LEAD_EFF_MAX = 0.6 // UP: lead first when the bump was not realised
 const EARLY_MIN = 45 // DOWN: lead first when reached ≥ 45 min before the peak
 const HARD_DELTA = [1, 6]
+const WATER_HARD_MAX = 30 // the tank's Δ (validate: water.tune.maxDeltaF 10–30)
 const HARD_LEAD = [20, 240]
 const LEAD_STEP_CAP = 30
 const DEFAULT_BAND = [68, 78]
@@ -325,6 +341,10 @@ export function buildContext(input) {
     clampF: { coolingMin: numOr(cf.coolingMin, DEFAULT_CLAMP.coolingMin), heatingMax: numOr(cf.heatingMax, DEFAULT_CLAMP.heatingMax) },
     outdoorEnabled: cfg.outdoor?.enabled === true,
     forecast: isObj(i.forecast) ? i.forecast : null,
+    // the water season (a host's hot-water tank): its scald ceiling (injected — the host's kinds.ceilingF — else from
+    // cfg.water) and its reading floor water.comfortMinF
+    ceilingF: isNum(i.ceilingF) ? i.ceilingF : Math.min(numOr(cfg.water?.maxSetpointF, 140), cfg.water?.mixingValve === true ? 140 : 125),
+    waterFloorF: numOr(cfg.water?.comfortMinF, 105),
     baseChangedAt: i.baseChangedAt ?? null,
     windowDates: winDates,
     modelDates: modDates,
@@ -373,6 +393,7 @@ export function detectSeason(ctx) {
   const days = dateRange(c.tz, c.analysisDate, SEASON_LOOK_DAYS)
   for (const ep of episodesIn(c, days)) {
     if (ep.dryRun || ep.status === 'absent' || ep.status === 'dry' || ep.status === 'was_off') continue
+    if (ep.season === 'water') return 'water' // a tank's episode says its season (a pre-heat's sign reads 'heating')
     const s = takeSign(ep)
     if (s) return s
     if (ep.par && (ep.season === 'heating' || ep.season === 'cooling')) return ep.season
@@ -412,8 +433,10 @@ export function forcedByMaster(ep) {
 
 // A participating precondition-event episode of the season (E before the Release 4 evidence filters); never a boundary
 // episode (addendum E E1.15: no shed window — its realisation is used by realisation() only)
-const takesPart = (ep, season) => ep.season === season && ep.precondition === true && !ep.dryRun &&
-  (ep.status === 'done' || ep.status === 'released') && ep.q !== 'dry' && ep.kind !== 'boundary'
+// The water season: a tank pre-heats before every peak (its episode's par, not the event's flag) and an episode with
+// neither a tank reading nor a hot-water level (q 'no_sensor') is never evidence (G1.11)
+const takesPart = (ep, season) => ep.season === season && (ep.precondition === true || (season === 'water' && isObj(ep.par))) && !ep.dryRun &&
+  (ep.status === 'done' || ep.status === 'released') && ep.q !== 'dry' && ep.q !== 'no_sensor' && ep.kind !== 'boundary'
 
 /**
  * §5.4 E: episodes of this unit in the report window with season = s, a precondition event, not
@@ -604,7 +627,9 @@ function stepGuardrails(ctx) {
 export function stepFor(dir, ctx, cur) {
   const F = Array.isArray(ctx?.F) ? ctx.F : Array.isArray(ctx?.fresh) ? ctx.fresh : []
   const g = stepGuardrails(ctx)
+  const water = ctx?.season === 'water'
   const season = ctx?.season === 'cooling' ? 'cooling' : 'heating'
+  const dStep = water ? Math.max(1, numOr(g.maxStepDeltaF, 5)) : 1 // the tank steps Δ by water.tune.stepDeltaF
   const pk = numOr(g.peakStartMin, 420)
   const earliest = numOr(g.earliestStartMin, 270)
   const stepLead = Math.max(0, Math.min(LEAD_STEP_CAP, numOr(g.maxStepLeadMin, LEAD_STEP_CAP)))
@@ -621,12 +646,13 @@ export function stepFor(dir, ctx, cur) {
     let origMed = median(F.map((e) => e?.pre?.orig).filter(isNum))
     if (origMed == null && Array.isArray(ctx?.E)) origMed = median(ctx.E.map((e) => e?.pre?.orig).filter(isNum))
     let guard = true
-    if (origMed != null && isNum(deltaF)) {
+    if (water && origMed != null && isNum(deltaF)) guard = origMed + deltaF + dStep <= numOr(ctx?.ceilingF, 125) + 1e-9 // J32
+    else if (origMed != null && isNum(deltaF)) {
       guard = season === 'heating'
         ? origMed + deltaF + 1 <= Math.min(numOr(band[1], DEFAULT_BAND[1]), numOr(cf.heatingMax, DEFAULT_CLAMP.heatingMax)) + 1e-9
         : origMed - deltaF - 1 >= Math.max(numOr(band[0], DEFAULT_BAND[0]), numOr(cf.coolingMin, DEFAULT_CLAMP.coolingMin)) - 1e-9
     }
-    if (isNum(deltaF) && deltaF + 1 <= numOr(g.maxDeltaF, 4) + 1e-9 && guard && !capped) return { param: 'deltaF', from: deltaF, to: deltaF + 1 }
+    if (isNum(deltaF) && deltaF + dStep <= numOr(g.maxDeltaF, 4) + 1e-9 && guard && !capped) return { param: 'deltaF', from: deltaF, to: deltaF + dStep }
     if (leadCanGrow) return { param: 'leadMin', from: leadMin, to: leadMin + stepLead }
     return { hold: 'at_limit' }
   }
@@ -634,7 +660,7 @@ export function stepFor(dir, ctx, cur) {
     const early = median(F.slice(0, R2_NEED).map((e) => e?.pre?.reachedMinBeforePeak).filter(isNum))
     const baseTooLong = (cur?.leadSource ?? cur?.source) === 'config' && leadMin > pk - earliest
     if (early != null && early >= EARLY_MIN && isNum(leadMin) && !baseTooLong && stepLead > 0 && leadMin - stepLead >= numOr(g.minLeadMin, 60)) return { param: 'leadMin', from: leadMin, to: leadMin - stepLead }
-    if (isNum(deltaF) && deltaF - 1 >= numOr(g.minDeltaF, 1) - 1e-9) return { param: 'deltaF', from: deltaF, to: deltaF - 1 }
+    if (isNum(deltaF) && deltaF - dStep >= numOr(g.minDeltaF, 1) - 1e-9) return { param: 'deltaF', from: deltaF, to: deltaF - dStep }
     return { hold: 'guardrail' }
   }
   return { hold: 'guardrail' }
@@ -655,9 +681,10 @@ export function clampStep(cur, next, guardrails, peakStartMin) {
   const g = isObj(guardrails) ? guardrails : {}
   let to = next.to
   if (next.param === 'deltaF') {
+    const water = g.season === 'water' // the tank's guardrails (tuning.guardrails(cfg, 'water')): Δ 5–25 by 5
     const lo = Math.max(HARD_DELTA[0], numOr(g.minDeltaF, 1))
-    const hi = Math.min(HARD_DELTA[1], numOr(g.maxDeltaF, 4))
-    const stepMax = Math.min(1, Math.max(0, numOr(g.maxStepDeltaF, 1)))
+    const hi = water ? Math.min(WATER_HARD_MAX, numOr(g.maxDeltaF, 25)) : Math.min(HARD_DELTA[1], numOr(g.maxDeltaF, 4))
+    const stepMax = water ? Math.max(0, numOr(g.maxStepDeltaF, 5)) : Math.min(1, Math.max(0, numOr(g.maxStepDeltaF, 1)))
     if (lo > hi || stepMax <= 0) return null
     to = clamp(to, lo, hi)
     if (Math.abs(to - from) > stepMax + 1e-9) to = from + dir * stepMax
@@ -686,6 +713,7 @@ const countedOverride = (o) => isObj(o) && o.comfortDir === true && !o.auto && o
 /** R1: latest fresh episode violated, or released by a comfort-direction override during the shed. */
 function breach(ep) {
   if (!ep) return false
+  if (ep.season === 'water' && (numOr(ep.shed?.floorMin, 0) > 0 || numOr(ep.shed?.lowMin, 0) > 0)) return true // G1.11
   if (ep.shed?.class === 'violated') return true
   if (ep.status !== 'released') return false
   const off = isNum(ep.shed?.offAt) ? ep.shed.offAt : Number(ep.peakStart)
@@ -709,7 +737,13 @@ function r5Signal(F) {
 
 function comfortable(ep, cc) {
   const sh = ep?.shed
-  return !!sh && sh.class === 'comfortable' && isNum(sh.cov) && sh.cov >= cc && !(ep.overrides ?? []).some((o) => isObj(o) && o.comfortDir === true)
+  const noOverride = !(ep?.overrides ?? []).some((o) => isObj(o) && o.comfortDir === true)
+  // the tank: never at or below its floor, never 'low' — comfortable by its reading, or (no reading) by its level
+  if (ep?.season === 'water') {
+    return !!sh && noOverride && numOr(sh.floorMin, 0) === 0 && numOr(sh.lowMin, 0) === 0 &&
+      ((sh.class === 'comfortable' && isNum(sh.cov) && sh.cov >= cc) || (sh.class === 'unknown' && isObj(sh.levels)))
+  }
+  return !!sh && sh.class === 'comfortable' && isNum(sh.cov) && sh.cov >= cc && noOverride
 }
 
 /** R4a: the last dormantDays closed days each have a rollup with onMin.total = 0 and coverage ≥ 0.5 — none away (H). */
@@ -841,6 +875,7 @@ export function proposeFor(input) {
   const obs = observeInfo({ cfg: c.cfg, state: c.state, unitState: c.unitState, tz: c.tz, now: c.now, applyDate: c.applyDate })
   res.observe = obs.observe || !c.live
   if (season) res.model = fitDriftModel(episodesIn(c, c.modelDates).filter((ep) => ep.season === season && !forcedByMaster(ep) && ep.kind !== 'boundary'))
+  const water = season === 'water' // G1.12: no drift model (fitDriftModel never fits 'water'), no R3, no veto
 
   // R4b resume (comfort-safe: bypasses G1/G2, observe and the lock, exactly like tuning.check('resume')):
   // auto-tune off freezes tuned values, never a dormancy pause on a unit that is used again.
@@ -892,7 +927,7 @@ export function proposeFor(input) {
   if (!isNum(covD) || covD < LOW_DATA_COV || jobsBad) return setHold(res, c, 'low_data')
 
   // evidence
-  const g = c.guardrails
+  const g = water ? tuningGuardrails(c.cfg, 'water') : c.guardrails
   const cur = curParams(c, season)
   const E = qualifying(c, season)
   const F = fresh(c, season, E)
@@ -929,7 +964,7 @@ export function proposeFor(input) {
   res.signals.R3 = R3
   res.signals.R2 = have >= R2_NEED
 
-  const band = [c.band[0], c.band[1]]
+  const band = water ? [c.waterFloorF, c.ceilingF] : [c.band[0], c.band[1]]
   const worstOf = (eps) => {
     const vals = eps.map((ep) => (s > 0 ? ep.shed?.Tmin : ep.shed?.Tmax)).filter(isNum)
     if (!vals.length) return null
@@ -952,8 +987,15 @@ export function proposeFor(input) {
     const trig = R1 ? 'R1' : r5.fire ? 'R5' : 'R3'
     const fz = frozenUntil('up')
     if (fz) return setHold(res, c, 'frozen', { dir: 'up', untilLabel: weekday(c.tz, fz) })
-    const step = stepFor('up', { season, F, E, guardrails: g, bandCfg: c.bandCfg, clampF: c.clampF }, cur)
+    const step = stepFor('up', { season, F, E, guardrails: g, bandCfg: c.bandCfg, clampF: c.clampF, ceilingF: c.ceilingF }, cur)
     if (step.hold) {
+      if (step.hold === 'at_limit' && water) {
+        const name = c.names[c.unitId] ?? c.unitId ?? 'This unit'
+        const worst = worstOf(f0 ? [f0] : [])
+        const why = worst != null ? `${name}'s tank still drops to ${T.temp(worst)} during the peak.` : `${name}'s hot water still runs low during the peak.`
+        res.suggestion = { text: `${why} It can't pre-heat more — the ${T.temp(c.ceilingF)} scald limit; tell the app if a mixing valve is installed.` }
+        return setHold(res, c, step.hold, { ceilingF: c.ceilingF })
+      }
       if (step.hold === 'at_limit') {
         // Worded per trigger: only R1 is a breach, and "maximum" only when +1 Δ would pass the guardrail
         // max (stepFor's test); otherwise the setpoint guard or a capped TAKE stopped it — always so for
@@ -974,7 +1016,7 @@ export function proposeFor(input) {
     }
     const cd = cooldownUntil(step.param, 'up')
     if (cd) return setHold(res, c, 'cooldown', { untilLabel: weekday(c.tz, cd) })
-    const cl = clampStep(cur, step, g, c.peakStartMin)
+    const cl = clampStep(cur, step, g, g.peakStartMin ?? c.peakStartMin)
     if (!cl) return setHold(res, c, 'guardrail')
     const rule = trig === 'R1' ? (cl.param === 'leadMin' ? 'R1_LEAD' : 'R1_DELTA') : trig
     const evidence = {
@@ -1011,6 +1053,9 @@ export function proposeFor(input) {
 
   // ── G3 learning: R1/R2/R5 need at least one fresh episode (C6.3: forced_by_master when the newest was the master's) ──
   if (!F.length) {
+    // G1.11: a tank reporting neither its temperature nor a hot-water level can't be learned from
+    const newestW = water ? episodesIn(c, c.windowDates).find((ep) => ep.season === 'water' && isObj(ep.par) && !ep.dryRun) : null
+    if (newestW?.q === 'no_sensor') return setHold(res, c, 'no_sensor')
     const newest = episodesIn(c, c.windowDates).find((ep) => takesPart(ep, season))
     const fz = newest ? forcedByMaster(newest) : null
     if (fz) return setHold(res, c, 'forced_by_master', { byName: c.names[fz.by] ?? fz.by ?? undefined, dayLabel: weekday(c.tz, newest.date ?? localDate(c.tz, secToMs(newest.peakStart))) })
@@ -1029,11 +1074,11 @@ export function proposeFor(input) {
   const fz = frozenUntil('down')
   if (fz) return setHold(res, c, 'frozen', { dir: 'down', untilLabel: weekday(c.tz, fz) })
   if (veto) return setHold(res, c, 'veto')
-  const step = stepFor('down', { season, F, E, guardrails: g, bandCfg: c.bandCfg, clampF: c.clampF }, cur)
+  const step = stepFor('down', { season, F, E, guardrails: g, bandCfg: c.bandCfg, clampF: c.clampF, ceilingF: c.ceilingF }, cur)
   if (step.hold) return setHold(res, c, 'guardrail')
   const cd = cooldownUntil(step.param, 'down')
   if (cd) return setHold(res, c, 'cooldown', { untilLabel: weekday(c.tz, cd) })
-  const cl = clampStep(cur, step, g, c.peakStartMin)
+  const cl = clampStep(cur, step, g, g.peakStartMin ?? c.peakStartMin)
   if (!cl) return setHold(res, c, 'guardrail')
   const rule = cl.param === 'leadMin' ? 'R2_LEAD' : 'R2_DELTA'
   const ms = F3.map((ep) => ep.shed?.m).filter(isNum)

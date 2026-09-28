@@ -289,6 +289,7 @@ export function guardrails(cfg, season = null) {
   return {
     minDeltaF, maxDeltaF, minLeadMin, maxLeadMin, earliestStart, earliestStartMin, peakStartMin,
     maxStepDeltaF: w ? Math.max(1, w.stepDeltaF) : Math.max(0, numOr(opt.maxStepDeltaF, DEFAULTS.maxStepDeltaF)),
+    ...(w ? { season: WATER_SEASON } : {}), // the tank's guardrails say so (the optimizer's step and clamp read it)
     maxStepLeadMin: Math.max(0, numOr(opt.maxStepLeadMin, DEFAULTS.maxStepLeadMin)),
   }
 }

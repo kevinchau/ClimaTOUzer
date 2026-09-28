@@ -19,6 +19,10 @@
 // rationale(rule, evidence, names?, tz?) → one sentence (≤ ~120 chars) for rules R1_DELTA, R1_LEAD, R5, R3, R2_DELTA,
 //   R2_LEAD, R4A, R4B, RESET, REVERT (unknown rule ⇒ "<Unit>: <change summary>").
 // holdText(code, ctx?) → the hold chip for an optimizer hold code (optimizer.HOLD_CODES, plus 'dry_run' / 'observe').
+//   The water season (a host's hot-water tank): at_limit reads the scald limit (ctx.ceilingF), no_sensor "… reports
+//   neither its tank temperature nor a hot-water level — auto-tune can't learn; pre-heat stays at +15° from 4:00", and the
+//   R1_DELTA / R2_DELTA rationales speak of "<Unit>'s tank" ("Water heater's tank dropped to 103° during Tue's morning
+//   peak (floor 105°). Pre-heat +5° → +10° from today 4:00 AM.").
 // seasonWords(season) → the season's word table {heating, verb:'Pre-heat', noun, sign, edge:'floor', comfort, …};
 // nameOf(names, unitId) → the display name; plural(word, n) — shared with a host's other texts.
 //
@@ -141,12 +145,14 @@ export function rationale(rule, evidence, names, tz) {
   const edge = band ? (W.heating ? band[0] : band[1]) : null
   const worst = W.heating ? ev.minRoom : ev.maxRoom
   const eventLabel = ev.eventLabel || 'morning peak'
+  const water = ev.season === 'water' // a hot-water tank: its reading is the tank's
+  const subj = water ? `${u}'s tank` : u
   switch (rule) {
     case 'R1_DELTA': {
       const when = ev.dayLabel ? `${ev.dayLabel}'s ${eventLabel}` : `the last ${eventLabel}`
       const s1 = isNum(worst)
-        ? `${u} ${W.moved} to ${temp(worst)} during ${when}${isNum(edge) ? ` (${W.edge} ${temp(edge)})` : ''}.`
-        : `${u} left its comfort band during ${when}.`
+        ? `${subj} ${W.moved} to ${temp(worst)} during ${when}${isNum(edge) ? ` (${W.edge} ${temp(edge)})` : ''}.`
+        : water ? `${u} ran low on hot water during ${when}.` : `${u} left its comfort band during ${when}.`
       return `${s1} ${W.verb} ${dl(ev.from)} → ${dl(ev.to)}${fromWhen(ev, tz)}.`
     }
     case 'R1_LEAD': {
@@ -175,8 +181,8 @@ export function rationale(rule, evidence, names, tz) {
       const margin = isNum(ev.marginF) ? Number(ev.marginF) : (isNum(worst) && isNum(edge) ? Math.abs(Number(worst) - Number(edge)) : null)
       const n = isNum(ev.n) ? ev.n : 3
       const s1 = isNum(worst)
-        ? `${u} stayed ${W.bound} ${temp(worst)} through the last ${n} peaks${isNum(margin) ? `, ${temp(margin)} ${W.side} your ${W.edge}` : ''}.`
-        : `${u} stayed comfortable through the last ${n} peaks.`
+        ? `${subj} stayed ${W.bound} ${temp(worst)} through the last ${n} peaks${isNum(margin) && !water ? `, ${temp(margin)} ${W.side} your ${W.edge}` : ''}.`
+        : water ? `${u} had hot water through the last ${n} peaks.` : `${u} stayed comfortable through the last ${n} peaks.`
       return `${s1} Trying less ${W.noun}: ${dl(ev.from)} → ${dl(ev.to)}.`
     }
     case 'R2_LEAD': {
@@ -240,7 +246,10 @@ export function holdText(code, ctx = {}) {
     case 'hysteresis': return 'Waiting a few days before reversing direction'
     case 'veto': return `Forecast model says ${c.paramLabel || 'the current setting'} is still needed`
     case 'sensor': return 'Room sensor looked stuck or jumpy while off — not lowering'
-    case 'at_limit': return `At maximum ${W.noun} — raise the max, widen the band, or opt out`
+    case 'at_limit': return c.season === 'water'
+      ? `At the ${isNum(c.ceilingF) ? temp(c.ceilingF) : '125°'} scald limit — tell the app if a mixing valve is installed`
+      : `At maximum ${W.noun} — raise the max, widen the band, or opt out`
+    case 'no_sensor': return `${c.unitName || 'The water heater'} reports neither its tank temperature nor a hot-water level — auto-tune can't learn; pre-heat stays at ${pl}`
     case 'frozen': {
       const what = c.dir !== 'up' ? 'Lowering' : c.season === 'heating' || c.season === 'cooling' ? `More ${W.noun}` : 'Raising'
       return `${what} paused after two reverts${c.untilLabel ? ` until ${c.untilLabel}` : ''}`
