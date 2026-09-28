@@ -3,7 +3,7 @@
 **Time-of-use pre-conditioning for heat pumps: the rate model, the window math and the learning behind a scheduler
 that banks cheap energy before the peak and coasts through it.**
 
-![tests](https://img.shields.io/badge/tests-460%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-492%20passing-brightgreen)
 ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2020-339933)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -57,6 +57,9 @@ through an injected time zone, so results are identical on any machine.
   move a running window.
 - **Episode extraction.** `rollupDay` turns a day of 5-minute samples and action lines into per-unit rollups and
   one episode per event: T0, Tpk, rise, eff, t90, reached, drift while shed, comfort class, overrides, sensor flags.
+  A host's house-mode `m` records (the reference app's Standard, Left Home and Vacation) mark when each unit was
+  away: its away minutes are counted apart from the comfort band (`band.awayMin`, never a comfort miss) and an
+  episode whose window the house was away for is `away` — never the optimizer's evidence, still a drift sample.
 - **The drift model.** `optimizer.fitDriftModel` fits Newton cooling per room; `optimizer.requiredDelta` turns an
   outdoor forecast into the Δ the next peak needs.
 - **The tuning decision table.** `proposeFor` applies R1 breach, R5 overrides, R3 forecast and R2 comfortable with
@@ -383,7 +386,7 @@ Constants: `TIERS`, `PRECONDITION_MODES`, `PRECONDITION_FANS`, `HOLIDAY_PRESETS`
 npm test            # node --test test/*.test.js
 ```
 
-460 tests, no network, no files written. Every suite that touches wall-clock time re-runs
+492 tests, no network, no files written. Every suite that touches wall-clock time re-runs
 itself under `TZ=UTC` and `TZ=Asia/Tokyo` and must pass unchanged. Beyond the unit tests:
 
 - **Property suites.** The optimizer runs 2 000 seeded contexts (plus 500 focused on the forecast rule), each in
