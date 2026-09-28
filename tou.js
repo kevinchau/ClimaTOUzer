@@ -36,6 +36,25 @@
 //   boundary event, addendum E E1.4), then turns OFF.
 //   nextBoundaryAfter wakes at peakStart + fanOnlyMin for both seasons; PlanDay units carry fanOnlyUntil.
 //
+// Unit kinds (the reference app's Addendum G — the core never imports the host's kind table; the host injects it):
+//   seasonOf is a REQUIRED input of entryEffFor (opts.seasonOf(mode) → season) and plan (opts.seasonOf(mode, unitCfg) →
+//   season): a missing function throws TypeError('seasonOf required') — no silent Daikin season survives for a unit whose
+//   kind the core does not know (a water heater's 'Heat Pump' is 'water', a Mysa always 'heating'). dryOutUntilFor and
+//   preconditionWindow take the season itself; preconditionWindow reads leadMin[season] for 'water' too.
+//   entryEffFor opts.preconditions?(event) → bool: whether this unit pre-conditions `event` whatever its flag (a water
+//   heater pre-heats before every peak): the eff it returns (frozen params too) carries `precondition`, which
+//   preconditionWindow / activeEventFor / eventOverlapping read in place of event.precondition.
+//   plan opts.unitRules?(unitCfg) → {shed?: 'off' | 'setback', dryOut?: bool, preconditions?(event), preconditionMode?(mode),
+//   bumpLimits?(season, caps) → {floor, ceiling} | null} | null — absent ⇒ a Daikin head's (shed 'off', dry-out, the
+//   precondition.modes gate, clampF ∩ 61–90): PlanDay units[id].shed 'setback' for a setback unit (still 'opted out' |
+//   'skipped' | 'released' first), fanOnlyUntil / dryout / entryDryOut none without dry-out.
+//   bumpTarget(original, season, deltaF, limits, step = 1, tol = 0.6) → {target, moves} — THE bump (the host's decide
+//   calls it with kinds.bumpLimits): heating / water ⇒ max(min(roundToStep(original + Δ), ceiling), floor); cooling ⇒
+//   min(max(roundToStep(original − Δ), floor), ceiling); moves = the target moves the intended way by more than tol;
+//   {target: null, moves: false} without limits, a season or a finite original. plan() bumps with tol 0.
+//   resolveEntry / entryResolution read a NAMED mode's season only for an entry with the cool-to / heat-to pair, which
+//   only a Daikin head carries (pairSeason, HEAT / COOL / DRY); a keep-mode entry's season is the run context's.
+//
 // Effective params (H6): tou does not import tuning.js (it would create an import cycle with
 // tuning.gateOpen → activeEventFor), nor a host's multi-split / optimum-start modules (they import tou). plan() accepts
 // `opts.effectivePrecondition` (inject tuning.effectivePrecondition); without it a faithful copy of
@@ -252,9 +271,9 @@ export function firstPreconditionDate(cfg, tz, fromDate, maxDays = 8) {
  * frozen auto.params). → {preStart, peakStart, leadMin, season} | null
  */
 export function preconditionWindow(cfg, tz, event, season, eff) {
-  if (!event || !event.precondition) return null
+  if (!event || !(eff?.precondition ?? event.precondition)) return null
   if (eff?.suspended) return null
-  const s = season === 'cooling' ? 'cooling' : 'heating'
+  const s = season === 'cooling' || season === 'water' ? season : 'heating'
   const date = event.date ?? String(event.id).split('@')[0]
   const pc = cfg?.precondition ?? {}
   let leadMin = Number(eff?.leadMin ?? pick(pc.leadMin, s) ?? 120)
@@ -379,7 +398,7 @@ export function activeEventFor(cfg, tz, unitCfg, now, eff) {
 function preStartOf(cfg, tz, unitCfg, e, eff) {
   const ef = typeof eff === 'function' ? eff(e) : eff
   if (unitCfg && unitCfg.precondition === false) return e.peakStart
-  if (!e.precondition || ef?.noPrecondition) return e.peakStart
+  if (!(ef?.precondition ?? e.precondition) || ef?.noPrecondition) return e.peakStart
   const w = preconditionWindow(cfg, tz, e, ef?.season ?? null, ef)
   return w ? w.preStart : e.peakStart
 }
@@ -490,15 +509,23 @@ export function resolveEntry(fields, rc) {
   const bare = fields.power == null // Addendum H: an instant row naming no power — it sets a running unit's setpoint
   if ((!bare && up(fields.power) !== 'ON') || (!hasPair(fields) && !keepsMode(fields))) return { ...fields }
   const m = keepsMode(fields) ? rc?.writeMode ?? null : fields.mode
-  const t = setpointFor(fields, followsRun(fields) ? rc?.season ?? null : seasonOfMode(fields.mode))
+  const t = setpointFor(fields, followsRun(fields) ? rc?.season ?? null : pairSeason(fields.mode))
   return { ...(bare ? {} : { power: fields.power }), ...(m ? { mode: m } : {}), ...(t != null ? { temp: t } : {}), ...(fields.fan != null ? { fan: fields.fan } : {}) }
 }
 
 /** The EntryDTO / activity-line view of a resolution: {season, mode?, temp?} (keys only when present). */
 export function entryResolution(fields, rc) {
   const R = resolveEntry(fields, rc) ?? {}
-  const season = followsRun(fields) ? rc?.season ?? null : seasonOfMode(fields?.mode)
+  const season = followsRun(fields) ? rc?.season ?? null : pairSeason(fields?.mode)
   return { season, ...(R.mode != null ? { mode: R.mode } : {}), ...(R.temp != null ? { temp: R.temp } : {}) }
+}
+
+// The season of an entry's NAMED mode when it carries the cool-to / heat-to pair — only a Daikin head carries the pair
+// (the reference app refuses it for other kinds: 'One setpoint for this unit'), so the mode is a Daikin mode by
+// construction: HEAT ⇒ heating, COOL / DRY ⇒ cooling. Never used for a keep-mode entry (the run context's season).
+function pairSeason(mode) {
+  const m = String(mode ?? '').toUpperCase()
+  return m === 'HEAT' ? 'heating' : m === 'COOL' || m === 'DRY' ? 'cooling' : null
 }
 
 // The entry's season is the run context's: it keeps the mode, or it is a row without power that names no mode (H).
@@ -506,10 +533,10 @@ function followsRun(fields) { return keepsMode(fields) || (!!fields && fields.po
 
 // The run context a projection uses when the host injects none (opts.runContext): the remembered mode — the stranded
 // one, then the read's — for a unit that is off; the read's for a unit that is on. Never a mode to write.
-function rememberedRc(us, live) {
+function rememberedRc(us, live, sOf) {
   const on = up(live?.power) === 'ON'
   const m = (on ? live?.mode : us?.stranded?.fields?.mode ?? live?.mode) ?? null
-  return { masterMode: null, mode: m == null ? null : up(m), season: seasonOfMode(m), writeMode: null, source: m == null ? null : on ? 'live' : 'remembered' }
+  return { masterMode: null, mode: m == null ? null : up(m), season: sOf(m) ?? null, writeMode: null, source: m == null ? null : on ? 'live' : 'remembered' }
 }
 
 /** Entry instants of one local date: the daily rows filtered by day type and the instant rows of that date (see header). */
@@ -612,20 +639,21 @@ export function armedAtOf(state, unitId) {
 // noPrecondition for an OFF E and suspended:false for an ON E (C-11); for a boundary event also when E is not an
 // ON entry and the unit does not read ON in a precondition mode — its own mode's season, Fan/Auto/unknown have none
 // (addendum E E1.8, J23). → {star, E, season, eff}
-function entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, livePower) {
-  const r = entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt)
-  const onLive = String(livePower ?? '').toUpperCase() === 'ON' && seasonOfMode(liveMode) != null
+function entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, livePower, preconditions = null) {
+  const r = entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, preconditions)
+  const onLive = String(livePower ?? '').toUpperCase() === 'ON' && seasonFn(liveMode) != null
   if (e.kind === 'boundary' && r.E?.fields.power !== 'ON' && !onLive) r.eff = { ...r.eff, noPrecondition: true }
   return r
 }
 
-function entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt) {
+function entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, preconditions) {
   const star = latestEntryAtOrBefore(cfg, tz, unitCfg, e.peakStart, armedAt)
   const on = star?.fields.power === 'ON'
   // Addendum F: a keep-mode E* names no mode — its season is the remembered mode's (stranded, then the read), through
   // the injected seasonOf (a follower's running master decides there)
   const season = seasonFn(on ? (star.fields.mode ?? unitState?.stranded?.fields?.mode ?? liveMode) : liveMode) ?? null
-  const eff = effFn(cfg, unitCfg, unitState, season ?? 'heating')
+  const eff0 = effFn(cfg, unitCfg, unitState, season ?? 'heating')
+  const eff = typeof preconditions === 'function' ? { ...eff0, precondition: !!preconditions(e) } : eff0
   if (!star) return { star, E: null, season, eff }
   const pre = preStartOf(cfg, tz, unitCfg, e, { ...eff, season, suspended: false })
   const E = star.at >= pre ? star : null
@@ -634,24 +662,18 @@ function entryPassCore(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn
 }
 
 /** B §1.3 effFor for one unit (see header). */
-export function entryEffFor(cfg, tz, unitCfg, unitState, liveMode, { effectivePrecondition, seasonOf, armedAt, livePower } = {}) {
+export function entryEffFor(cfg, tz, unitCfg, unitState, liveMode, { effectivePrecondition, seasonOf, armedAt, livePower, preconditions } = {}) {
+  if (typeof seasonOf !== 'function') throw new TypeError('seasonOf required')
   const effFn = typeof effectivePrecondition === 'function' ? effectivePrecondition : fallbackEff
-  const seasonFn = typeof seasonOf === 'function' ? seasonOf : seasonOfMode
+  const pre = typeof preconditions === 'function' ? preconditions : null
   const auto = unitState?.auto
   return (e) => {
-    if (auto && auto.phase && auto.phase !== 'idle' && auto.eventId === e.id && auto.params) return auto.params
-    return entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonFn, armedAt, livePower).eff
+    if (auto && auto.phase && auto.phase !== 'idle' && auto.eventId === e.id && auto.params) return pre ? { ...auto.params, precondition: !!pre(e) } : auto.params
+    return entryPass(cfg, tz, unitCfg, unitState, e, liveMode, effFn, seasonOf, armedAt, livePower, pre).eff
   }
 }
 
 // ---- plan (PlanDay DTO, §4.4 + H6) ------------------------------------------------------------
-
-function seasonOfMode(mode) {
-  const m = String(mode ?? '').toUpperCase()
-  if (m === 'HEAT') return 'heating'
-  if (m === 'COOL' || m === 'DRY') return 'cooling'
-  return null
-}
 
 // Faithful copy of addendum §5.2 effectivePrecondition (used when tuning.js is not injected): per-parameter
 // provenance and read-time clamps of the TUNED parameter only, as tuning.js (addendum D X1.1, A-11).
@@ -688,13 +710,24 @@ function fmtNum(n) {
 
 function hmm(tz, ms) { const p = tz.localParts(ms); return `${p.hour}:${String(p.minute).padStart(2, '0')}` }
 
-// §2.4 bump: clamp(round_to_step(original ± Δ), [coolingMin | heatingMax] ∩ [61, 90]).
-function bump(original, season, deltaF, clampF, step) {
+/** THE §2.4 bump with injected limits (see header — Addendum G: the host's kinds.bumpLimits). */
+export function bumpTarget(original, season, deltaF, limits, step = 1, tol = 0.6) {
+  const o = Number(original)
+  if (!Number.isFinite(o) || !limits || (season !== 'cooling' && season !== 'heating' && season !== 'water')) return { target: null, moves: false }
   const cool = season === 'cooling'
-  let t = roundToStep(original + (cool ? -deltaF : deltaF), step)
-  if (cool) t = Math.min(Math.max(t, Math.max(Number(clampF?.coolingMin ?? 65), 61)), 90)
-  else t = Math.max(Math.min(t, Math.min(Number(clampF?.heatingMax ?? 76), 90)), 61)
-  return { target: t, moves: cool ? t < original - 1e-9 : t > original + 1e-9 }
+  const d = Math.abs(Number.isFinite(Number(deltaF)) && deltaF !== null && deltaF !== '' ? Number(deltaF) : 0)
+  const s = Number(step) > 0 ? Number(step) : 1
+  const t0 = roundToStep(o + (cool ? -d : d), s)
+  const t = cool ? Math.min(Math.max(t0, limits.floor), limits.ceiling) : Math.max(Math.min(t0, limits.ceiling), limits.floor)
+  const tl = Number(tol) || 0
+  return { target: t, moves: cool ? t < o - tl - 1e-9 : t > o + tl + 1e-9 }
+}
+
+// A head's bump limits in a plan (no device caps): clampF ∩ 61–90 — the host's kinds.bumpLimits for a Daikin head.
+function headLimits(season, clampF) {
+  if (season === 'cooling') return { floor: Math.max(Number(clampF?.coolingMin ?? 65), 61), ceiling: 90 }
+  if (season === 'heating') return { floor: 61, ceiling: Math.min(Number(clampF?.heatingMax ?? 76), 90) }
+  return null
 }
 
 // PlanDay fanOnlyUntil (addendum B §3.4): while the unit is in shed for `e`, the persisted auto.dryOutUntil
@@ -702,12 +735,12 @@ function bump(original, season, deltaF, clampF, step) {
 // engaged, else live; a unit an ON precondition entry turns on runs in the entry's mode) by the F2.7 rule —
 // running in COOL/DRY/HEAT with FAN in the unit's caps (unknown caps count as having it) ⇒ dryOutUntilFor
 // from peakStart. null when the unit does not shed `e` or goes straight to OFF.
-function planDryOut(cfg, e, shed, auto, active, src, caps) {
-  if (shed !== 'off') return null
+function planDryOut(cfg, e, shed, auto, active, src, caps, sOf, dryOut = true) {
+  if (shed !== 'off' || !dryOut) return null
   if (active && auto.phase === 'shed') return msOf(auto.dryOutUntil)
   if (!src || String(src.power ?? '').toUpperCase() !== 'ON') return null
   if (!hasFan(caps)) return null
-  return dryOutUntilFor(cfg, e, seasonOfMode(src.mode))
+  return dryOutUntilFor(cfg, e, sOf(src.mode))
 }
 
 function hasFan(caps) {
@@ -747,8 +780,11 @@ function dryoutSkipText(v) {
   return `skipped if ${list} ${names.length === 1 ? 'is' : 'are'} ${verb}`
 }
 
-function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armedAt, unitLedger, rcAt) {
-  let shed = 'off'
+function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armedAt, unitLedger, rcAt, sOf, rules) {
+  const R0 = rules ?? {}
+  const dryOut = R0.dryOut !== false
+  const preconditions = typeof R0.preconditions === 'function' ? R0.preconditions : null
+  let shed = R0.shed === 'setback' ? 'setback' : 'off' // Addendum G: a setback unit's shed is its setpoint
   if (u.shed === false) shed = 'opted out'
   else if (us?.skipDate === e.date || ledgerEntry?.status === 'skipped') shed = 'skipped'
   else if (ledgerEntry?.status === 'released') shed = 'released'
@@ -757,9 +793,9 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   const active = !!auto && auto.eventId === e.id && auto.phase && auto.phase !== 'idle'
   const src = active ? (auto.baseline ?? live) : live
   // addendum B F3.11: the window's season comes from E* (the latest entry at or before peakStart) when it says ON
-  const pass = active && auto.params ? null : entryPass(cfg, tz, u, us, e, src?.mode, effFn, seasonOfMode, armedAt, earlyStraddles(unitLedger, e) ? null : src?.power)
+  const pass = active && auto.params ? null : entryPass(cfg, tz, u, us, e, src?.mode, effFn, sOf, armedAt, earlyStraddles(unitLedger, e) ? null : src?.power, preconditions)
   const season = pass ? pass.season : auto.params.season
-  const eff = pass ? pass.eff : auto.params
+  const eff = pass ? pass.eff : preconditions ? { ...auto.params, precondition: !!preconditions(e) } : auto.params
   const winStart = preStartOf(cfg, tz, u, e, eff)
   const E = active ? (auto.entry ?? null) : shed === 'opted out' ? null : pass.E
   const R = shed === 'opted out' || shed === 'skipped' ? null : active ? (auto.entry ?? null) : eventEntry(cfg, tz, u, e, Math.min(winStart, pass.E?.at ?? Infinity), e.peakEnd - 1, armedAt)
@@ -767,19 +803,19 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   // Addendum F: a keep-mode E runs the run context's mode at peakStart, in its season (auto.entry's while engaged)
   const eKeep = eOn && keepsMode(E.fields)
   const rcPeak = eOn && resolves(E.fields) ? rcAt(e.peakStart) : null
-  const eSeason = !eOn ? null : eKeep ? (E.season !== undefined ? E.season : rcPeak?.season ?? null) : seasonOfMode(E.fields.mode)
-  const eMode = !eKeep ? E?.fields?.mode : seasonOfMode(rcPeak?.mode) === eSeason ? up(rcPeak.mode) : eSeason === 'heating' ? 'HEAT' : eSeason === 'cooling' ? 'COOL' : null
+  const eSeason = !eOn ? null : eKeep ? (E.season !== undefined ? E.season : rcPeak?.season ?? null) : sOf(E.fields.mode)
+  const eMode = !eKeep ? E?.fields?.mode : sOf(rcPeak?.mode) === eSeason ? up(rcPeak.mode) : eSeason === 'heating' ? 'HEAT' : eSeason === 'cooling' ? 'COOL' : null
   const runSrc = !active && eOn && !(shed !== 'off') ? { power: 'ON', mode: eMode } : src
   const restoreOf = (x) => (resolves(x.fields) ? x.resolved ?? resolveEntry(x.fields, rcAt(msOf(x.at))) : x.fields)
   const res = {
     precondition: 'off', shed, preStart: null, target: null, source: null,
-    fanOnlyUntil: iso(planDryOut(cfg, e, shed, auto, active, runSrc, live?.caps)),
+    fanOnlyUntil: iso(planDryOut(cfg, e, shed, auto, active, runSrc, live?.caps, sOf, dryOut)),
     entry: entryRef(tz, E, rcPeak),
     // a row without power (H) restores its season's setpoint in F's verb form ("heat to 62°")
     restore: !R ? null : R.fields?.power === 'OFF' ? 'stays off' : R.fields?.power == null ? settingLabel(R.fields, { season: resolutionOf(R, rcAt(msOf(R.at))).season }) : settingLabel(restoreOf(R)),
-    dryout: shed === 'off' && e.kind !== 'boundary' ? dryoutSkipText(dryoutSkip) : null, // a boundary never sheds (E1.4)
+    dryout: shed === 'off' && dryOut && e.kind !== 'boundary' ? dryoutSkipText(dryoutSkip) : null, // a boundary never sheds (E1.4)
   }
-  if (!e.precondition || u.shed === false || u.precondition === false) return res
+  if (!(preconditions ? preconditions(e) : e.precondition) || u.shed === false || u.precondition === false) return res
 
   if (!active && E?.fields.power === 'OFF') { res.precondition = 'skip: scheduled off'; return res }
   if (eff?.suspended) { res.precondition = 'skip: paused (unit idle for days)'; return res }
@@ -790,6 +826,8 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   const tail = ` from ${hmm(tz, win.preStart)}${res.source === 'tuned' ? ' · auto-tuned' : ''}`
   const verbOf = (s) => (s === 'cooling' ? 'cool' : 'heat')
   const modes = Array.isArray(cfg?.precondition?.modes) ? cfg.precondition.modes : ['COOL', 'DRY', 'HEAT']
+  const preMode = typeof R0.preconditionMode === 'function' ? (m) => !!R0.preconditionMode(m) : (m) => modes.includes(m)
+  const limitsOf = typeof R0.bumpLimits === 'function' ? (s, clampF) => R0.bumpLimits(s, live?.caps ?? null, clampF) : headLimits
   const sched = eOn ? ` (scheduled ${settingLabel(E.fields, { fan: false, season: eSeason })})` : ''
   const owned = active ? auto.owned?.temp : null
   if (owned && Number.isFinite(Number(owned.original)) && Number.isFinite(Number(owned.applied))) {
@@ -811,14 +849,15 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
     const mode = up(eMode)
     const s = eSeason
     if (eKeep && !s) { res.precondition = 'skip: season unknown'; return res }
-    if (eKeep && !modes.includes(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
-    if (!s || !modes.includes(mode)) { res.precondition = `skip: scheduled mode ${modeLabel(mode) || 'unknown'}`; return res }
+    if (eKeep && !preMode(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
+    if (!s || !preMode(mode)) { res.precondition = `skip: scheduled mode ${modeLabel(mode) || 'unknown'}`; return res }
     const sp = setpointFor(E.fields, s)
     const base = Number.isFinite(Number(sp)) ? Number(sp) : Number(src?.temp)
     if (!Number.isFinite(base)) { res.precondition = `±${fmtNum(deltaF)}°${tail}${sched}`; return res }
-    const { target, moves } = bump(base, s, deltaF, clampF, step)
+    const { target, moves } = bumpTarget(base, s, deltaF, limitsOf(s, clampF), step, 0)
+    if (target == null) { res.precondition = `±${fmtNum(deltaF)}°${tail}${sched}`; return res }
     const lt = Number(src?.temp)
-    const running = String(src?.power ?? '').toUpperCase() === 'ON' && seasonOfMode(src?.mode) === s && Number.isFinite(lt)
+    const running = String(src?.power ?? '').toUpperCase() === 'ON' && sOf(src?.mode) === s && Number.isFinite(lt)
     const kept = running ? (s === 'cooling' ? Math.min(target, lt) : Math.max(target, lt)) : target
     if (running && Math.abs(kept - lt) < 1e-9) {
       res.precondition = `keeps ${fmtNum(lt)}° (already ${s === 'cooling' ? 'below' : 'above'} the ${fmtNum(target)}° target)`
@@ -833,10 +872,11 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   if (!src) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
   if (String(src.power ?? '').toUpperCase() !== 'ON') { res.precondition = 'skip: unit off'; return res }
   const mode = String(src.mode ?? '').toUpperCase()
-  if (!season || !modes.includes(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
+  if (!season || !preMode(mode)) { res.precondition = `skip: mode ${mode || 'unknown'}`; return res }
   const original = Number(src.temp)
   if (!Number.isFinite(original)) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
-  const { target, moves } = bump(original, season, deltaF, clampF, step)
+  const { target, moves } = bumpTarget(original, season, deltaF, limitsOf(season, clampF), step, 0)
+  if (target == null) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
   if (!moves) { res.precondition = season === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
   res.target = target
   res.precondition = `${verbOf(season)} ${season === 'cooling' ? MINUS : '+'}${fmtNum(Math.abs(target - original))}° → ${fmtNum(target)}°${tail}`
@@ -857,8 +897,8 @@ function earlyStraddles(ledger, e) {
 // optimum start: startAt/lead from opts.early for the one entry its result names, else earlyMax = the cap
 // when an early start is possible at all (cap > 0, the unit pre-conditions, not folded, no window overlaps
 // [at − cap, at]).
-function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedAt, rcAt) {
-  const opts = { effectivePrecondition: effFn, armedAt }
+function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedAt, rcAt, sOf, rules) {
+  const opts = { effectivePrecondition: effFn, armedAt, seasonOf: sOf, ...(typeof rules?.preconditions === 'function' ? { preconditions: rules.preconditions } : {}) }
   const onFor = entryEffFor(cfg, tz, u, us, live?.mode, { ...opts, livePower: live?.power })
   const offFor = entryEffFor(cfg, tz, u, us, live?.mode, { ...opts, livePower: null })
   const effFor = (e) => (earlyStraddles(ledger, e) ? offFor : onFor)(e) // E1.10, as decide's effFor
@@ -894,9 +934,9 @@ function planEntries(cfg, tz, date, u, us, ledger, live, effFn, earlyRes, armedA
 // reading ON in a conditioning mode, FAN in caps (unknown caps count), fanOnlyMin[season] > 0 — dries out
 // after its next OFF entry of the date (at > opts.now): until = X.at + fanOnlyMin[season]. tou's own
 // mode→season helper (a follower's live mode already is the master's; a master in Fan leaves it reading Fan).
-function planEntryDryOut(cfg, live, list, now) {
-  if (!live || String(live.power ?? '').toUpperCase() !== 'ON' || !hasFan(live.caps)) return undefined
-  const s = seasonOfMode(live.mode)
+function planEntryDryOut(cfg, live, list, now, sOf, dryOut = true) {
+  if (!dryOut || !live || String(live.power ?? '').toUpperCase() !== 'ON' || !hasFan(live.caps)) return undefined
+  const s = sOf(live.mode)
   const x = s ? list.find((y) => y.fields.power === 'OFF' && msOf(y.at) > now) : null
   const min = x ? Number(x.dryOutMin ?? pick(cfg?.shed?.fanOnlyMin, s) ?? FAN_ONLY_MIN[s]) : 0 // an instant row's own minutes (H)
   return min > 0 ? { until: iso(msOf(x.at) + min * MIN_MS) } : undefined
@@ -946,6 +986,10 @@ function planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf) {
  * @param opts.live  map {unitId: live} or function unitId → live|null (the host's live reads); used for the
  *                   per-unit precondition text when the unit does not own the event.
  * @param opts.effectivePrecondition  inject tuning.effectivePrecondition (else §5.2 fallback).
+ * @param opts.seasonOf  REQUIRED (mode, unitCfg) → 'heating' | 'cooling' | 'water' | null — the host's season of a mode on
+ *                   a unit (TypeError 'seasonOf required' without it; see the header's unit kinds).
+ * @param opts.unitRules  (unitCfg) → {shed?, dryOut?, preconditions?(event), preconditionMode?(mode), bumpLimits?(season,
+ *                   caps, clampF)} | null — what a non-Daikin unit kind does (header); absent ⇒ a head's rules.
  * @param opts.early  {unitId: early.optimumStart result | null} (addendum D E2.11, injected like the eff).
  * @param opts.dryoutSkip  {unitId: [names] | {units:[names], season}} — the master's keepsConditioning forecast,
  *                   computed by the host (the reference app's multi-split module, addendum C CD-5); tou only words it.
@@ -973,6 +1017,9 @@ function planMarkers(cfg, tz, units, entries, perUnit, evById, liveOf) {
  * is judged not ON for that boundary (E1.10, decide's effFor rule), so the plan shows no pre-condition for it.
  */
 export function plan(cfg, state, tz, date, opts = {}) {
+  if (typeof opts?.seasonOf !== 'function') throw new TypeError('seasonOf required')
+  const seasonFnOf = (u) => (m) => opts.seasonOf(m, u) ?? null // Addendum G: the host's season of a mode on unit u
+  const rulesOf = (u) => (typeof opts.unitRules === 'function' ? opts.unitRules(u) ?? null : null)
   const liveOf = typeof opts.live === 'function' ? opts.live : (id) => opts.live?.[id] ?? null
   const effFn = typeof opts.effectivePrecondition === 'function' ? opts.effectivePrecondition : fallbackEff
   const now = Number.isFinite(opts.now) ? opts.now : -Infinity
@@ -980,7 +1027,7 @@ export function plan(cfg, state, tz, date, opts = {}) {
   // mode without it. Read only for entries that resolve (keep the mode / carry the pair).
   const rcFor = (u, us) => {
     const f = opts.runContext?.[u.id]
-    return (at) => (typeof f === 'function' ? f(at) : null) ?? rememberedRc(us, liveOf(u.id))
+    return (at) => (typeof f === 'function' ? f(at) : null) ?? rememberedRc(us, liveOf(u.id), seasonFnOf(u))
   }
   const units = (Array.isArray(cfg?.units) ? cfg.units : [])
     .map((u, i) => ({ u, i }))
@@ -993,7 +1040,7 @@ export function plan(cfg, state, tz, date, opts = {}) {
     let unitPre = null
     for (const u of units) {
       const us = state?.units?.[u.id] ?? null
-      const entry = unitPlan(cfg, tz, e, u, us, state?.ledger?.[u.id]?.[e.id] ?? null, liveOf(u.id), effFn, opts.dryoutSkip?.[u.id], armedAtOf(state, u.id), state?.ledger?.[u.id], rcFor(u, us))
+      const entry = unitPlan(cfg, tz, e, u, us, state?.ledger?.[u.id]?.[e.id] ?? null, liveOf(u.id), effFn, opts.dryoutSkip?.[u.id], armedAtOf(state, u.id), state?.ledger?.[u.id], rcFor(u, us), seasonFnOf(u), rulesOf(u))
       perUnit[u.id] = entry
       if (entry.preStart && (unitPre === null || entry.preStart < unitPre)) unitPre = entry.preStart
     }
@@ -1008,8 +1055,8 @@ export function plan(cfg, state, tz, date, opts = {}) {
   const perUnit = {}
   for (const u of units) {
     const us = state?.units?.[u.id] ?? null
-    entries[u.id] = planEntries(cfg, tz, date, u, us, state?.ledger?.[u.id], liveOf(u.id), effFn, opts.early?.[u.id] ?? null, armedAtOf(state, u.id), rcFor(u, us))
-    const dry = planEntryDryOut(cfg, liveOf(u.id), entries[u.id], now)
+    entries[u.id] = planEntries(cfg, tz, date, u, us, state?.ledger?.[u.id], liveOf(u.id), effFn, opts.early?.[u.id] ?? null, armedAtOf(state, u.id), rcFor(u, us), seasonFnOf(u), rulesOf(u))
+    const dry = planEntryDryOut(cfg, liveOf(u.id), entries[u.id], now, seasonFnOf(u), rulesOf(u)?.dryOut !== false)
     perUnit[u.id] = dry ? { entryDryOut: dry } : {}
   }
   // addendum E §3.4: a unit's ON entry AT a boundary is its pre-condition's target, applied by the return at t — it

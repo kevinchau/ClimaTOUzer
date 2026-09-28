@@ -28,6 +28,11 @@ if (process.env.FK_TZ_CHILD !== '1') {
 }
 
 const tz = makeTz('America/Los_Angeles')
+// Addendum G: seasonOf is a REQUIRED input of plan / entryEffFor — the core never guesses a Daikin season for a unit
+// whose kind it does not know; this suite's units are Daikin-style heads (plan passes (mode, unitCfg), entryEffFor (mode))
+const seasonOf = (m) => ({ HEAT: 'heating', COOL: 'cooling', DRY: 'cooling' })[String(m ?? '').toUpperCase()] ?? null
+const planOf = (cfg, state, tzz, date, opts = {}) => tou.plan(cfg, state, tzz, date, { seasonOf, ...opts })
+const effForOf = (cfg, tzz, u, us, mode, opts = {}) => tou.entryEffFor(cfg, tzz, u, us, mode, { seasonOf, ...opts })
 const L = (date, hhmm) => tz.zonedToInstant(date, hhmm)
 const hm = (ms) => tz.localParts(ms).hhmm
 const day = (ms) => tz.localParts(ms).date
@@ -422,15 +427,15 @@ test('R4-3 arming (F3.4, J8): eventEntry, entryEffFor’s E* and plan leave out 
   // F3.11 pass 1: an E* older than the arming is no entry — an OFF one no longer cancels the precondition, an ON one no
   // longer overrides a suspension or picks the season
   const off = withSched([{ at: '06:30', power: 'OFF' }])
-  assert.equal(tou.entryEffFor(off.cfg, tz, off.u, null, 'HEAT')(ev).noPrecondition, true)
-  assert.equal(tou.entryEffFor(off.cfg, tz, off.u, null, 'HEAT', { armedAt: L(THU, '06:45') })(ev).noPrecondition, undefined)
+  assert.equal(effForOf(off.cfg, tz, off.u, null, 'HEAT')(ev).noPrecondition, true)
+  assert.equal(effForOf(off.cfg, tz, off.u, null, 'HEAT', { armedAt: L(THU, '06:45') })(ev).noPrecondition, undefined)
   const suspended = { auto: { phase: 'idle' }, tuning: { suspended: { since: THU } } }
-  const e1 = tou.entryEffFor(cfg, tz, u, suspended, 'COOL', { armedAt: L(THU, '07:30') })(ev)
+  const e1 = effForOf(cfg, tz, u, suspended, 'COOL', { armedAt: L(THU, '07:30') })(ev)
   assert.deepEqual([e1.season, e1.suspended], ['cooling', true], 'live rules')
   // plan: armedAtOf(state, id) — the event unit's entry / restore / precondition text agree with decide
   const live = { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }
   const only7 = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 }])
-  const armedPlan = (st) => tou.plan(only7.cfg, { units: {}, ledger: {}, ...st }, tz, THU, { live }).events[0].units.kitchen
+  const armedPlan = (st) => planOf(only7.cfg, { units: {}, ledger: {}, ...st }, tz, THU, { live }).events[0].units.kitchen
   const k0 = armedPlan({})
   assert.deepEqual([k0.entry?.key, k0.restore], ['s:2026-09-24@07:00', 'Heat 70°'])
   for (const st of [{ scheduleArmedAt: new Date(L(THU, '07:30')).toISOString() }, { units: { kitchen: { scheduleEditedAt: new Date(L(THU, '07:30')).toISOString() } } }]) {
@@ -483,25 +488,25 @@ test('entryEffFor (B §1.3 effFor): season from E* at peakStart, OFF ⇒ noPreco
   const heat = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 }])
   const ev = tou.events(heat.cfg, tz, THU)[0]
   const suspended = { auto: { phase: 'idle' }, tuning: { suspended: { since: THU } } }
-  const e1 = tou.entryEffFor(heat.cfg, tz, heat.u, suspended, 'COOL')(ev)
+  const e1 = effForOf(heat.cfg, tz, heat.u, suspended, 'COOL')(ev)
   assert.equal(e1.season, 'heating', "the entry's mode, not the live COOL")
   assert.equal(e1.suspended, false, 'C-11: an ON entry at peak overrides the suspension')
   const off = withSched([{ at: '06:30', power: 'OFF' }])
-  assert.equal(tou.entryEffFor(off.cfg, tz, off.u, null, 'HEAT')(ev).noPrecondition, true)
+  assert.equal(effForOf(off.cfg, tz, off.u, null, 'HEAT')(ev).noPrecondition, true)
   // F3.11's second pass: an E* before preStart already fired — live rules (yesterday's 22:00 Off never cancels a morning)
   const night = withSched([{ at: '22:00', power: 'OFF' }])
-  assert.equal(tou.entryEffFor(night.cfg, tz, night.u, null, 'HEAT')(ev).noPrecondition, undefined)
+  assert.equal(effForOf(night.cfg, tz, night.u, null, 'HEAT')(ev).noPrecondition, undefined)
   const early4 = withSched([{ at: '04:00', power: 'ON', mode: 'COOL' }])
-  const e4 = tou.entryEffFor(early4.cfg, tz, early4.u, suspended, 'HEAT')(ev)
+  const e4 = effForOf(early4.cfg, tz, early4.u, suspended, 'HEAT')(ev)
   assert.deepEqual([e4.season, e4.suspended], ['cooling', true], "E*'s season, but no suspension override for an entry before the window")
   const none = withSched([])
-  const e3 = tou.entryEffFor(none.cfg, tz, none.u, suspended, 'COOL')(ev)
+  const e3 = effForOf(none.cfg, tz, none.u, suspended, 'COOL')(ev)
   assert.deepEqual([e3.season, e3.suspended, e3.noPrecondition], ['cooling', true, undefined], 'no entry ⇒ live rules')
   const params = { season: 'heating', leadMin: 90, source: 'config' }
   const engaged = { auto: { phase: 'precondition', eventId: ev.id, params } }
-  assert.equal(tou.entryEffFor(heat.cfg, tz, heat.u, engaged, 'COOL')(ev), params, 'H5: frozen while engaged')
+  assert.equal(effForOf(heat.cfg, tz, heat.u, engaged, 'COOL')(ev), params, 'H5: frozen while engaged')
   // an injected seasonOf (decide passes C's seasonFor through it)
-  assert.equal(tou.entryEffFor(heat.cfg, tz, heat.u, null, 'COOL', { seasonOf: () => 'cooling' })(ev).season, 'cooling')
+  assert.equal(effForOf(heat.cfg, tz, heat.u, null, 'COOL', { seasonOf: () => 'cooling' })(ev).season, 'cooling')
 })
 
 test('armedAtOf (F3.4): max(scheduleArmedAt, units[id].scheduleEditedAt)', () => {
@@ -522,7 +527,7 @@ test('nextBoundaryAfter wakes at entry instants of every unit (B §5.2)', () => 
 test('plan (B §3.4, C F3.11′): entry precondition texts, entry / restore / fanOnlyUntil per event unit', () => {
   const { cfg } = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW', days: 'weekday' }, { at: '22:00', power: 'OFF' }])
   const live = { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }
-  const p = tou.plan(cfg, { units: {}, ledger: {} }, tz, THU, { live })
+  const p = planOf(cfg, { units: {}, ledger: {} }, tz, THU, { live })
   const k = p.events[0].units.kitchen
   assert.equal(k.precondition, 'heat +3° → 73° from 5:00 (scheduled Heat 70°)', 'the entry authorizes the ON of an OFF unit')
   assert.equal(k.preStart, ISOL(THU, '05:00'))
@@ -534,26 +539,26 @@ test('plan (B §3.4, C F3.11′): entry precondition texts, entry / restore / fa
   assert.deepEqual([evening.entry, evening.restore], [null, null])
   // an OFF entry at or before peakStart inside the window: no precondition, silently
   const off = withSched([{ at: '06:30', power: 'OFF' }])
-  const po = tou.plan(off.cfg, { units: {} }, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } } }).events[0].units.kitchen
+  const po = planOf(off.cfg, { units: {} }, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } } }).events[0].units.kitchen
   assert.deepEqual([po.precondition, po.preStart, po.restore], ['skip: scheduled off', null, 'stays off'])
   // an entry in Fan: skipped with the scheduled mode
   const fan = withSched([{ at: '07:00', power: 'ON', mode: 'FAN' }])
-  assert.equal(tou.plan(fan.cfg, { units: {} }, tz, THU, { live }).events[0].units.kitchen.precondition, 'skip: scheduled mode Fan')
+  assert.equal(planOf(fan.cfg, { units: {} }, tz, THU, { live }).events[0].units.kitchen.precondition, 'skip: scheduled mode Fan')
   // F3.11′: a running unit already past the bumped target in the entry's season keeps its setpoint
   const cool = withSched([{ at: '07:00', power: 'ON', mode: 'COOL', temp: 74 }], 'office')
-  const pc = tou.plan(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'COOL', temp: 68 } } }).events[0].units.office
+  const pc = planOf(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'COOL', temp: 68 } } }).events[0].units.office
   assert.deepEqual([pc.precondition, pc.target], ['keeps 68° (already below the 71° target)', null])
-  const warmer = tou.plan(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'COOL', temp: 72 } } }).events[0].units.office
+  const warmer = planOf(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'COOL', temp: 72 } } }).events[0].units.office
   assert.deepEqual([warmer.precondition, warmer.target], ['cool −1° → 71° from 5:00 (scheduled Cool 74°)', 71])
-  const inFan = tou.plan(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'FAN', temp: 68 } } }).events[0].units.office
+  const inFan = planOf(cool.cfg, { units: {} }, tz, THU, { live: { office: { power: 'ON', mode: 'FAN', temp: 68 } } }).events[0].units.office
   assert.equal(inFan.precondition, 'cool −3° → 71° from 5:00 (scheduled Cool 74°)', 'a unit in Fan is pre-cooled to the bumped target, never 68 (B-1)')
   const heatKeep = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 }])
-  assert.equal(tou.plan(heatKeep.cfg, { units: {} }, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 74 } } }).events[0].units.kitchen.precondition, 'keeps 74° (already above the 73° target)')
+  assert.equal(planOf(heatKeep.cfg, { units: {} }, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 74 } } }).events[0].units.kitchen.precondition, 'keeps 74° (already above the 73° target)')
   // while engaged: auto.entry and the owned temp (base = the entry's temp)
   const eng = { units: { kitchen: { auto: { phase: 'precondition', eventId: '2026-09-24@07:00', params: { season: 'heating', deltaF: 3, leadMin: 120, source: 'config' },
     entry: { key: 's:2026-09-24@07:00', at: ISOL(THU, '07:00'), fields: { power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW' } },
     owned: { power: { original: 'OFF', applied: 'ON', status: 'held' }, temp: { original: 68, applied: 73, status: 'held' } }, baseline: { power: 'OFF', mode: 'COOL', temp: 68 } } } } }
-  const pe = tou.plan(cfg, eng, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 73 } } }).events[0].units.kitchen
+  const pe = planOf(cfg, eng, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 73 } } }).events[0].units.kitchen
   assert.equal(pe.precondition, 'heat +3° → 73° from 5:00 (scheduled Heat 70°)')
   assert.equal(pe.entry.label, 'On · Heat 70° · Low')
   assert.equal(pe.restore, 'Heat 70° · Low')
@@ -561,7 +566,7 @@ test('plan (B §3.4, C F3.11′): entry precondition texts, entry / restore / fa
   const opt = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT' }])
   opt.u.shed = false
   opt.u.precondition = false
-  const pp = tou.plan(opt.cfg, { units: {} }, tz, THU, { live, dryoutSkip: { 'living-room': ['Office'], office: { units: ['Kitchen', 'Den'], season: 'heating' } } })
+  const pp = planOf(opt.cfg, { units: {} }, tz, THU, { live, dryoutSkip: { 'living-room': ['Office'], office: { units: ['Kitchen', 'Den'], season: 'heating' } } })
   assert.deepEqual([pp.events[0].units.kitchen.entry, pp.events[0].units.kitchen.restore], [null, null])
   assert.equal(pp.events[0].units['living-room'].dryout, 'skipped if Office is cooling')
   assert.equal(pp.events[0].units.office.dryout, 'skipped if Kitchen and Den are heating')
@@ -571,7 +576,7 @@ test('plan (B §3.4, C F3.11′): entry precondition texts, entry / restore / fa
 test('plan (B §3.4, D E1/E2): entries per unit — days, folded, startAt/lead from opts.early, earlyMax', () => {
   const { cfg } = withSched(KITCHEN_SCHED)
   cfg.precondition.optimumStart = 60
-  const thu = tou.plan(cfg, { units: {}, ledger: {} }, tz, THU, { live: {} })
+  const thu = planOf(cfg, { units: {}, ledger: {} }, tz, THU, { live: {} })
   assert.deepEqual(Object.keys(thu.entries).sort(), ['kitchen', 'living-room', 'office'])
   assert.deepEqual(thu.entries.office, [])
   assert.deepEqual(thu.entries.kitchen.map((x) => [x.key, x.at, x.atLabel, x.label, x.folded, x.days, x.startAt ?? null, x.earlyMax ?? null]), [
@@ -580,19 +585,19 @@ test('plan (B §3.4, D E1/E2): entries per unit — days, folded, startAt/lead f
   ])
   assert.deepEqual(thu.entries.kitchen[0].fields, { power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW' })
   // a skipped event does not fold: entries fire on time (F3.14)
-  const skipped = tou.plan(cfg, { units: { kitchen: { skipDate: THU } }, ledger: {} }, tz, THU, { live: {} })
+  const skipped = planOf(cfg, { units: { kitchen: { skipDate: THU } }, ledger: {} }, tz, THU, { live: {} })
   assert.equal(skipped.entries.kitchen[0].folded, null)
   // Saturday: no peak ⇒ the ON entry may start early
-  const noInj = tou.plan(cfg, { units: {}, ledger: {} }, tz, SAT, { live: {} })
+  const noInj = planOf(cfg, { units: {}, ledger: {} }, tz, SAT, { live: {} })
   assert.deepEqual(noInj.entries.kitchen.map((x) => [x.hhmm ?? x.atLabel, x.startAt ?? null, x.earlyMax ?? null]), [['7:00', null, 60], ['22:00', null, null]])
   const early = { kitchen: { entry: { key: 's:2026-09-26@07:00' }, startAt: L(SAT, '06:05'), lead: 55 } }
-  const inj = tou.plan(cfg, { units: {}, ledger: {} }, tz, SAT, { live: {}, early })
+  const inj = planOf(cfg, { units: {}, ledger: {} }, tz, SAT, { live: {}, early })
   assert.deepEqual([inj.entries.kitchen[0].startAt, inj.entries.kitchen[0].lead, inj.entries.kitchen[0].earlyMax], [ISOL(SAT, '06:05'), 55, undefined])
-  const tomorrow = tou.plan(cfg, { units: {}, ledger: {} }, tz, '2026-09-27', { live: {}, early })
+  const tomorrow = planOf(cfg, { units: {}, ledger: {} }, tz, '2026-09-27', { live: {}, early })
   assert.deepEqual([tomorrow.entries.kitchen[0].startAt, tomorrow.entries.kitchen[0].earlyMax], [undefined, 60], "tomorrow's entry: only the cap")
   // precondition:false ⇒ never an early start
   cfg.units.find((u) => u.id === 'kitchen').precondition = false
-  assert.equal(tou.plan(cfg, { units: {} }, tz, SAT, { live: {} }).entries.kitchen[0].earlyMax, undefined)
+  assert.equal(planOf(cfg, { units: {} }, tz, SAT, { live: {} }).entries.kitchen[0].earlyMax, undefined)
 })
 
 test('plan (C §3.5, D E4): units[id].entryDryOut from the live read and the markers', () => {
@@ -601,19 +606,19 @@ test('plan (C §3.5, D E4): units[id].entryDryOut from the live read and the mar
   cfg.units.find((u) => u.id === 'office').schedule = [{ at: '22:00', power: 'OFF' }, { at: '14:00', power: 'OFF' }]
   const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 70, room: 66 }, office: { power: 'ON', mode: 'COOL', temp: 74, caps: { modes: ['COOL', 'FAN'] } } }
   const early = { kitchen: { entry: { key: 's:2026-09-26@07:00' }, startAt: L(SAT, '06:05'), lead: 55 } }
-  const p = tou.plan(cfg, { units: {}, ledger: {} }, tz, SAT, { live, early, now: L(SAT, '12:00') })
+  const p = planOf(cfg, { units: {}, ledger: {} }, tz, SAT, { live, early, now: L(SAT, '12:00') })
   assert.deepEqual(p.units.kitchen, { entryDryOut: { until: ISOL(SAT, '22:15') } }, 'heating 15 min after the next OFF entry')
   assert.deepEqual(p.units.office, { entryDryOut: { until: ISOL(SAT, '15:00') } }, 'the NEXT OFF entry (14:00), cooling 60')
   assert.deepEqual(p.units['living-room'], {}, 'no read ⇒ no prediction')
-  const late = tou.plan(cfg, { units: {} }, tz, SAT, { live, now: L(SAT, '23:00') })
+  const late = planOf(cfg, { units: {} }, tz, SAT, { live, now: L(SAT, '23:00') })
   assert.deepEqual(late.units.kitchen, {}, 'no OFF entry after now')
-  const inFan = tou.plan(cfg, { units: {} }, tz, SAT, { live: { office: { power: 'ON', mode: 'FAN' } }, now: L(SAT, '12:00') })
+  const inFan = planOf(cfg, { units: {} }, tz, SAT, { live: { office: { power: 'ON', mode: 'FAN' } }, now: L(SAT, '12:00') })
   assert.deepEqual(inFan.units.office, {}, 'a unit in Fan (a follower under a master in Fan) predicts nothing')
-  const noFan = tou.plan(cfg, { units: {} }, tz, SAT, { live: { office: { power: 'ON', mode: 'COOL', caps: { modes: ['COOL', 'HEAT'] } } }, now: L(SAT, '12:00') })
+  const noFan = planOf(cfg, { units: {} }, tz, SAT, { live: { office: { power: 'ON', mode: 'COOL', caps: { modes: ['COOL', 'HEAT'] } } }, now: L(SAT, '12:00') })
   assert.deepEqual(noFan.units.office, {}, 'no FAN in caps')
   const zero = structuredClone(cfg)
   zero.shed.fanOnlyMin = { cooling: 0, heating: 0 }
-  assert.deepEqual(tou.plan(zero, { units: {} }, tz, SAT, { live, now: L(SAT, '12:00') }).units.kitchen, {})
+  assert.deepEqual(planOf(zero, { units: {} }, tz, SAT, { live, now: L(SAT, '12:00') }).units.kitchen, {})
 
   const kinds = p.markers.map((m) => `${m.kind}@${hm(Date.parse(m.at))}${m.end ? `-${hm(Date.parse(m.end))}` : ''}:${m.units.join('+')}`)
   assert.deepEqual(kinds, ['start@06:05-07:00:kitchen', 'entry@07:00:kitchen', 'entry@14:00:office', 'dryout@14:00-15:00:office', 'entry@22:00:kitchen+office', 'dryout@22:00-22:15:kitchen'])
@@ -623,13 +628,13 @@ test('plan (C §3.5, D E4): units[id].entryDryOut from the live read and the mar
   assert.deepEqual(at22.lines.map((l) => [l.name, l.label, l.note]), [['Kitchen', 'Off', 'fan-only, then off at 10:15 PM'], ['Office', 'Off', null]], 'the band only on the predicted entry')
   assert.equal(p.markers.find((m) => m.kind === 'entry' && m.units[0] === 'office' && m.lines.length === 1).lines[0].note, 'fan-only, then off at 3:00 PM')
   // Thursday: a folded entry marks the restore; other ON entries say how early they may start
-  const thu = tou.plan(cfg, { units: {} }, tz, THU, { live: {} })
+  const thu = planOf(cfg, { units: {} }, tz, THU, { live: {} })
   const folded = thu.markers.find((m) => m.kind === 'folded')
   assert.deepEqual([folded.at, folded.lines[0].note], [ISOL(THU, '10:00'), 'applies at 10:00 AM when the peak ends'])
   cfg.units.find((u) => u.id === 'office').schedule = [{ at: '14:00', power: 'ON', mode: 'COOL' }]
-  const may = tou.plan(cfg, { units: {} }, tz, THU, { live: {} }).markers.find((m) => m.units.includes('office'))
+  const may = planOf(cfg, { units: {} }, tz, THU, { live: {} }).markers.find((m) => m.units.includes('office'))
   assert.equal(may.lines[0].note, 'may start up to 60 min early')
-  assert.deepEqual(tou.plan(cfgDefault(), { units: {} }, tz, THU, { live: {} }).markers, [])
+  assert.deepEqual(planOf(cfgDefault(), { units: {} }, tz, THU, { live: {} }).markers, [])
 })
 
 test('tou.js imports neither tuning.js nor system.js nor early.js (D E2.11, C CD-5)', async () => {
@@ -649,7 +654,7 @@ test('plan: weekday texts per unit (live, owned, flags, skip, ledger)', () => {
     'den': { power: 'ON', mode: 'COOL', temp: 72 },
   }
   const state = { units: { office: { skipDate: null } }, ledger: {} }
-  const p = tou.plan(cfg, state, tz, WED, { live })
+  const p = planOf(cfg, state, tz, WED, { live })
   assert.equal(p.date, WED)
   assert.equal(p.dow, 3)
   assert.equal(p.dayType, 'weekday')
@@ -675,14 +680,14 @@ test('plan: weekday texts per unit (live, owned, flags, skip, ledger)', () => {
   assert.equal(pm.units.kitchen.shed, 'off')
 
   const s2 = { units: { office: { skipDate: WED } }, ledger: { kitchen: { '2026-09-23@07:00': { status: 'released', at: 'x' } } } }
-  const p2 = tou.plan(cfg, s2, tz, WED, { live: (id) => live[id] })
+  const p2 = planOf(cfg, s2, tz, WED, { live: (id) => live[id] })
   assert.equal(p2.events[0].units.office.shed, 'skipped')
   assert.equal(p2.events[0].units.kitchen.shed, 'released')
 })
 
 test('plan: modes, clamps and missing reads', () => {
   const cfg = cfgDefault()
-  const txt = (l) => tou.plan(cfg, null, tz, WED, { live: { kitchen: l } }).events[0].units.kitchen.precondition
+  const txt = (l) => planOf(cfg, null, tz, WED, { live: { kitchen: l } }).events[0].units.kitchen.precondition
   assert.equal(txt({ power: 'ON', mode: 'DRY', temp: 74 }), 'cool −3° → 71° from 5:00')
   assert.equal(txt({ power: 'ON', mode: 'FAN', temp: 74 }), 'skip: mode FAN')
   assert.equal(txt({ power: 'ON', mode: 'AUTO', temp: 74 }), 'skip: mode AUTO')
@@ -710,27 +715,27 @@ test('plan (H6): frozen auto.params for the active event; tuned effective params
     },
   }
   // live has since drifted — the plan still reports the frozen ownership
-  const p = tou.plan(cfg, owning, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 74 } } })
+  const p = planOf(cfg, owning, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 74 } } })
   assert.equal(p.events[0].units.office.precondition, 'heat +4° → 74° from 4:30 · auto-tuned')
   assert.equal(p.events[0].units.office.preStart, new Date(L(WED, '04:30')).toISOString())
   assert.equal(p.events[0].preStart, new Date(L(WED, '04:30')).toISOString()) // earliest unit window
 
   // idle unit with a tuned value: fallback §5.2 effective params (clamped to maxDeltaF 4)
   const tuned = { units: { office: { tuning: { heating: { deltaF: 5, leadMin: 150 }, cooling: {} } } } }
-  const p2 = tou.plan(cfg, tuned, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } } })
+  const p2 = planOf(cfg, tuned, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } } })
   assert.equal(p2.events[0].units.office.precondition, 'heat +4° → 74° from 4:30 · auto-tuned')
   assert.equal(p2.events[0].units.office.source, 'tuned')
 
   // injected effectivePrecondition wins over the fallback
   let calls = 0
   const eff = (c, u, us, season) => { calls++; return { season, deltaF: 2, leadMin: 60, clampF: c.precondition.clampF, suspended: false, source: 'config' } }
-  const p3 = tou.plan(cfg, null, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } }, effectivePrecondition: eff })
+  const p3 = planOf(cfg, null, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } }, effectivePrecondition: eff })
   assert.equal(p3.events[0].units.office.precondition, 'heat +2° → 72° from 6:00')
   assert.ok(calls > 0)
 
   // suspended unit
   const susp = { units: { office: { tuning: { suspended: { since: WED, changeId: 't_x' } } } } }
-  assert.match(tou.plan(cfg, susp, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } } }).events[0].units.office.precondition, /^skip: paused/)
+  assert.match(planOf(cfg, susp, tz, WED, { live: { office: { power: 'ON', mode: 'HEAT', temp: 70 } } }).events[0].units.office.precondition, /^skip: paused/)
 })
 
 // ---- addendum B F2: fan-only dry-out ------------------------------------------------------------
@@ -779,7 +784,7 @@ test('plan: fanOnlyUntil per unit (addendum B §3.4) — prediction from the rea
     office: { power: 'ON', mode: 'HEAT', temp: 70 },
     'den': { power: 'ON', mode: 'COOL', temp: 72 },
   }
-  const p = tou.plan(cfg, null, tz, WED, { live })
+  const p = planOf(cfg, null, tz, WED, { live })
   const [am, pm] = p.events
   assert.equal(am.units.kitchen.fanOnlyUntil, isoAt('08:00'), 'running COOL ⇒ cooling 60')
   assert.equal(am.units.office.fanOnlyUntil, isoAt('07:15'), 'running HEAT ⇒ heating 15 (caps unknown ⇒ eligible)')
@@ -788,7 +793,7 @@ test('plan: fanOnlyUntil per unit (addendum B §3.4) — prediction from the rea
   assert.equal(pm.units.kitchen.fanOnlyUntil, isoAt('18:00'), 'the evening peak dries out too (F2.1)')
   assert.equal(pm.units.office.fanOnlyUntil, isoAt('17:15'))
 
-  const one = (l, state = null, c = cfg) => tou.plan(c, state, tz, WED, { live: { kitchen: l } }).events[0].units.kitchen.fanOnlyUntil
+  const one = (l, state = null, c = cfg) => planOf(c, state, tz, WED, { live: { kitchen: l } }).events[0].units.kitchen.fanOnlyUntil
   assert.equal(one({ power: 'ON', mode: 'DRY', temp: 74 }), isoAt('08:00'), 'DRY is cooling')
   assert.equal(one({ power: 'ON', mode: 'FAN', temp: 74 }), null, 'FAN ⇒ straight OFF (F2.4)')
   assert.equal(one({ power: 'ON', mode: 'AUTO', temp: 74 }), null, 'AUTO ⇒ straight OFF')
@@ -824,30 +829,30 @@ test('plan without injection = with injection for a Δ-only tuned unit (X1.1: fa
   cfg.optimizer = { enabled: true, earliestStart: '04:30', minDeltaF: 1, maxDeltaF: 4, minLeadMin: 60 }
   const state = { units: { kitchen: { auto: { phase: 'idle' }, tuning: { heating: { deltaF: 4, leadMin: null } } } }, ledger: {} }
   const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 68 } }
-  const fall = tou.plan(cfg, state, tz, '2026-09-23', { live })
-  const inj = tou.plan(cfg, state, tz, '2026-09-23', { live, effectivePrecondition })
+  const fall = planOf(cfg, state, tz, '2026-09-23', { live })
+  const inj = planOf(cfg, state, tz, '2026-09-23', { live, effectivePrecondition })
   const pre = (p) => p.events[0].units.kitchen.preStart
   assert.equal(pre(fall), new Date(L('2026-09-23', '04:00')).toISOString())
   assert.equal(pre(fall), pre(inj))
   // a tuned lead is still held to earliestStart on both paths
   state.units.kitchen.tuning.heating = { deltaF: null, leadMin: 180 }
-  assert.equal(pre(tou.plan(cfg, state, tz, '2026-09-23', { live })), new Date(L('2026-09-23', '04:30')).toISOString())
-  assert.equal(pre(tou.plan(cfg, state, tz, '2026-09-23', { live, effectivePrecondition })), new Date(L('2026-09-23', '04:30')).toISOString())
+  assert.equal(pre(planOf(cfg, state, tz, '2026-09-23', { live })), new Date(L('2026-09-23', '04:30')).toISOString())
+  assert.equal(pre(planOf(cfg, state, tz, '2026-09-23', { live, effectivePrecondition })), new Date(L('2026-09-23', '04:30')).toISOString())
 })
 
 test('plan: weekend and holiday days', () => {
   const cfg = cfgDefault()
-  const sat = tou.plan(cfg, null, tz, SAT)
+  const sat = planOf(cfg, null, tz, SAT)
   assert.equal(sat.dayType, 'weekend')
   assert.deepEqual(sat.events, [])
-  const tg = tou.plan(cfg, null, tz, THANKSGIVING)
+  const tg = planOf(cfg, null, tz, THANKSGIVING)
   assert.equal(tg.dayType, 'holiday')
   assert.equal(tg.holiday, 'Thanksgiving Day')
   assert.deepEqual(tg.events, [])
   assert.equal(tg.segments.length, 3)
   // addendum E: with the weekend pre-condition on, one boundary event each
   cfg.precondition.superOffPeak = { weekend: true }
-  for (const d of [SAT, THANKSGIVING]) assert.deepEqual(tou.plan(cfg, null, tz, d).events.map((e) => [e.id, e.kind]), [[`${d}@07:00`, 'boundary']], d)
+  for (const d of [SAT, THANKSGIVING]) assert.deepEqual(planOf(cfg, null, tz, d).events.map((e) => [e.id, e.kind]), [[`${d}@07:00`, 'boundary']], d)
 })
 
 test('validate additions (addendum §8): guardrails, earliestStart', () => {
@@ -1021,9 +1026,9 @@ test('E entryEffFor with livePower (E1.8): an OFF unit without an ON entry has n
   const eff = (schedule, liveMode, livePower, date = SAT) => {
     const cfg = cfgE({ schedule })
     const e = tou.events(cfg, tz, date)[0]
-    return { cfg, e, u: cfg.units[0], ef: tou.entryEffFor(cfg, tz, cfg.units[0], null, liveMode, { livePower })(e) }
+    return { cfg, e, u: cfg.units[0], ef: effForOf(cfg, tz, cfg.units[0], null, liveMode, { livePower })(e) }
   }
-  const at = (x, hhmm) => tou.activeEventFor(x.cfg, tz, x.u, L(SAT, hhmm), tou.entryEffFor(x.cfg, tz, x.u, null, 'HEAT', { livePower: x.lp }))
+  const at = (x, hhmm) => tou.activeEventFor(x.cfg, tz, x.u, L(SAT, hhmm), effForOf(x.cfg, tz, x.u, null, 'HEAT', { livePower: x.lp }))
   // OFF (or unknown) + no entry ⇒ noPrecondition
   for (const lp of ['OFF', 'off', null, undefined]) assert.equal(eff([], 'HEAT', lp).ef.noPrecondition, true, String(lp))
   assert.equal(eff([{ at: '22:00', power: 'OFF' }], 'HEAT', 'OFF').ef.noPrecondition, true, "yesterday's Off is no entry for the window")
@@ -1048,14 +1053,14 @@ test('E entryEffFor with livePower (E1.8): an OFF unit without an ON entry has n
   const cfg = cfgE()
   const b = boundaryOf(cfg, SAT)
   const params = { season: 'heating', leadMin: 120, source: 'config' }
-  assert.equal(tou.entryEffFor(cfg, tz, cfg.units[0], { auto: { phase: 'precondition', eventId: b.id, params } }, 'HEAT', { livePower: 'OFF' })(b), params)
+  assert.equal(effForOf(cfg, tz, cfg.units[0], { auto: { phase: 'precondition', eventId: b.id, params } }, 'HEAT', { livePower: 'OFF' })(b), params)
 })
 
 test('E entryEffFor / plan (E1.8, J23): a unit reading ON outside a precondition mode (Fan, Auto) has no boundary window; peaks and ON entries unaffected', () => {
   const eff = (schedule, liveMode, livePower, date = SAT) => {
     const cfg = cfgE({ schedule })
     const e = tou.events(cfg, tz, date)[0]
-    return tou.entryEffFor(cfg, tz, cfg.units[0], null, liveMode, { livePower })(e)
+    return effForOf(cfg, tz, cfg.units[0], null, liveMode, { livePower })(e)
   }
   for (const m of ['FAN', 'AUTO', 'fan', '', null, undefined]) assert.equal(eff([], m, 'ON').noPrecondition, true, `ON in ${m}`)
   for (const m of ['HEAT', 'COOL', 'DRY', 'cool']) assert.equal(eff([], m, 'ON').noPrecondition, undefined, `ON in ${m}`)
@@ -1068,7 +1073,7 @@ test('E entryEffFor / plan (E1.8, J23): a unit reading ON outside a precondition
   // plan: no window, no preStart for the Fan / Auto unit; a running Heat unit keeps its window
   for (const mode of ['FAN', 'AUTO']) {
     const cfg = cfgE({ schedule: [] })
-    const p = tou.plan(cfg, { units: {}, ledger: {} }, tz, SAT, { live: { kitchen: { power: 'ON', mode, temp: 70 }, 'living-room': { power: 'ON', mode: 'HEAT', temp: 70 } } })
+    const p = planOf(cfg, { units: {}, ledger: {} }, tz, SAT, { live: { kitchen: { power: 'ON', mode, temp: 70 }, 'living-room': { power: 'ON', mode: 'HEAT', temp: 70 } } })
     const k = p.events[0].units.kitchen
     assert.deepEqual([k.precondition, k.preStart, k.target], ['off', null, null], mode)
     assert.equal(p.events[0].units['living-room'].precondition, 'heat +3° → 73° from 5:00', mode)
@@ -1079,18 +1084,18 @@ test('E eventOverlapping / foldEventFor (E1.10): a boundary blocks an optimum st
   const sched = [{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70 }, { at: '07:30', power: 'ON', mode: 'HEAT', temp: 71 }]
   const withEntry = cfgE({ schedule: sched })
   const u = withEntry.units[0]
-  const effE = tou.entryEffFor(withEntry, tz, u, null, 'HEAT', { livePower: 'OFF' })
+  const effE = effForOf(withEntry, tz, u, null, 'HEAT', { livePower: 'OFF' })
   assert.equal(tou.eventOverlapping(withEntry, tz, u, L(SAT, '06:00'), L(SAT, '07:00'), effE), true, 'the 07:00 entry is the precondition target')
   assert.equal(tou.eventOverlapping(withEntry, tz, u, L(SAT, '06:30'), L(SAT, '07:30'), effE), true, 'a 07:30 entry within the cap is excluded too')
   assert.equal(tou.eventOverlapping(withEntry, tz, u, L(SAT, '07:00'), L(SAT, '08:00'), effE), false, 'a band from the boundary on')
   const bare = cfgE({ schedule: [{ at: '07:30', power: 'ON', mode: 'HEAT' }] })
   const v = bare.units[0]
-  const effB = tou.entryEffFor(bare, tz, v, null, 'HEAT', { livePower: 'OFF' })
+  const effB = effForOf(bare, tz, v, null, 'HEAT', { livePower: 'OFF' })
   assert.equal(tou.eventOverlapping(bare, tz, v, L(SAT, '06:00'), L(SAT, '07:00'), effB), false, 'an OFF unit without an ON entry at/before 07:00 has no window')
   assert.equal(tou.eventOverlapping(bare, tz, v, L(SAT, '06:30'), L(SAT, '07:30'), effB), false, 'so its 07:30 entry may start early')
-  assert.equal(tou.eventOverlapping(bare, tz, v, L(SAT, '06:30'), L(SAT, '07:30'), tou.entryEffFor(bare, tz, v, null, 'HEAT', { livePower: 'ON' })), true, 'a running unit pre-conditions')
+  assert.equal(tou.eventOverlapping(bare, tz, v, L(SAT, '06:30'), L(SAT, '07:30'), effForOf(bare, tz, v, null, 'HEAT', { livePower: 'ON' })), true, 'a running unit pre-conditions')
   // weekday: unchanged (an OFF unit still participates through its shed)
-  assert.equal(tou.eventOverlapping(bare, tz, v, L(THU, '06:00'), L(THU, '07:00'), tou.entryEffFor(bare, tz, v, null, 'HEAT', { livePower: 'OFF' })), true)
+  assert.equal(tou.eventOverlapping(bare, tz, v, L(THU, '06:00'), L(THU, '07:00'), effForOf(bare, tz, v, null, 'HEAT', { livePower: 'OFF' })), true)
   assert.equal(tou.eventOverlapping(bare, tz, v, L(THU, '06:00'), L(THU, '07:00'), () => ({ noPrecondition: true })), true, 'a noPrecondition peak still overlaps at peakStart')
   // folding: an entry inside [preStart, t) folds into the boundary; the entry at t never folds
   assert.equal(tou.foldEventFor(withEntry, tz, u, L(SAT, '06:30'), effE)?.id, `${SAT}@07:00`)
@@ -1102,7 +1107,7 @@ test('E plan (§3.4): Saturday — kind, preStart, per-unit texts, no fan-only /
   cfg.precondition.optimumStart = 60
   cfg.units[2].schedule = [{ at: '07:30', power: 'ON', mode: 'COOL', temp: 74 }]
   const live = { kitchen: { power: 'OFF', mode: 'FAN', temp: 70 }, 'living-room': { power: 'ON', mode: 'HEAT', temp: 70 }, office: { power: 'OFF', mode: 'COOL', temp: 74 } }
-  const p = tou.plan(cfg, { units: {}, ledger: {} }, tz, SAT, { live, dryoutSkip: { kitchen: ['Office'], 'living-room': ['Office'] } })
+  const p = planOf(cfg, { units: {}, ledger: {} }, tz, SAT, { live, dryoutSkip: { kitchen: ['Office'], 'living-room': ['Office'] } })
   assert.equal(p.events.length, 1)
   const e = p.events[0]
   assert.deepEqual([e.id, e.kind, e.preStart, e.peakStart, e.peakEnd, e.precondition], [`${SAT}@07:00`, 'boundary', ISOL(SAT, '05:00'), ISOL(SAT, '07:00'), ISOL(SAT, '07:00'), true])
@@ -1123,7 +1128,7 @@ test('E plan (§3.4): Saturday — kind, preStart, per-unit texts, no fan-only /
   // the option off: Release 4's Saturday
   const off = structuredClone(cfg)
   off.precondition.superOffPeak.weekend = false
-  const po = tou.plan(off, { units: {}, ledger: {} }, tz, SAT, { live })
+  const po = planOf(off, { units: {}, ledger: {} }, tz, SAT, { live })
   assert.deepEqual(po.events, [])
   assert.deepEqual(po.entries.kitchen.map((x) => [x.folded, x.earlyMax ?? null]), [[null, 60], [null, null]])
 })
@@ -1132,7 +1137,7 @@ test('E plan: boundary texts — already conditioned, scheduled off / Fan, skipp
   const unit = (schedule, liveU, state = { units: {}, ledger: {} }, id = 'office') => {
     const cfg = cfgE()
     cfg.units.find((u) => u.id === id).schedule = schedule
-    const p = tou.plan(cfg, state, tz, SAT, { live: { [id]: liveU } })
+    const p = planOf(cfg, state, tz, SAT, { live: { [id]: liveU } })
     return { u: p.events[0].units[id], entries: p.entries[id], markers: p.markers }
   }
   const cool74 = [{ at: '07:00', power: 'ON', mode: 'COOL', temp: 74 }]
@@ -1153,17 +1158,17 @@ test('E plan: boundary texts — already conditioned, scheduled off / Fan, skipp
   optOut.units[2].shed = false
   optOut.units[2].precondition = false
   optOut.units[2].schedule = cool74
-  const po = tou.plan(optOut, { units: {} }, tz, SAT, { live: {} })
+  const po = planOf(optOut, { units: {} }, tz, SAT, { live: {} })
   assert.deepEqual([po.events[0].units.office.shed, po.events[0].units.office.precondition, po.entries.office[0].folded], ['opted out', 'off', null])
-  const labor = tou.plan(cfgE({ schedule: [{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70, days: 'weekday' }] }), { units: {} }, tz, LABOR, { live: { kitchen: { power: 'OFF' } } })
+  const labor = planOf(cfgE({ schedule: [{ at: '07:00', power: 'ON', mode: 'HEAT', temp: 70, days: 'weekday' }] }), { units: {} }, tz, LABOR, { live: { kitchen: { power: 'OFF' } } })
   assert.deepEqual([labor.dayType, labor.events.map((e) => e.kind), labor.entries.kitchen, labor.events[0].units.kitchen.precondition], ['holiday', ['boundary'], [], 'off'], "a days:'weekday' entry is absent on a holiday")
 })
 
 test('E plan: a weekday is unchanged by the option except events[].kind', () => {
   const { cfg } = withSched(KITCHEN_SCHED)
   const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } }
-  const off = tou.plan(cfg, { units: {} }, tz, THU, { live })
-  const on = tou.plan({ ...cfg, precondition: { ...cfg.precondition, superOffPeak: { weekend: true } } }, { units: {} }, tz, THU, { live })
+  const off = planOf(cfg, { units: {} }, tz, THU, { live })
+  const on = planOf({ ...cfg, precondition: { ...cfg.precondition, superOffPeak: { weekend: true } } }, { units: {} }, tz, THU, { live })
   assert.deepEqual(on, off)
   assert.deepEqual(off.events.map((e) => e.kind), ['peak', 'peak'])
 })
@@ -1228,17 +1233,17 @@ test('F entry predicates and the one resolver (rule 1, rule 3, J28)', () => {
 test('F entryEffFor: a keep-mode E* takes its season from the remembered mode (stranded, then live) through the injected seasonOf', () => {
   const { cfg, u } = withSched([KEEP])
   const ev = tou.events(cfg, tz, MON)[0]
-  assert.equal(tou.entryEffFor(cfg, tz, u, null, 'COOL')(ev).season, 'cooling', 'the live mode')
-  assert.equal(tou.entryEffFor(cfg, tz, u, { stranded: { fields: { mode: 'HEAT' } } }, 'COOL')(ev).season, 'heating', 'the stranded mode first')
+  assert.equal(effForOf(cfg, tz, u, null, 'COOL')(ev).season, 'cooling', 'the live mode')
+  assert.equal(effForOf(cfg, tz, u, { stranded: { fields: { mode: 'HEAT' } } }, 'COOL')(ev).season, 'heating', 'the stranded mode first')
   const seen = []
   const master = (own) => { seen.push(own); return 'heating' } // decide injects C's seasonFor: a running master's season
-  assert.equal(tou.entryEffFor(cfg, tz, u, null, 'FAN', { seasonOf: master })(ev).season, 'heating')
+  assert.equal(effForOf(cfg, tz, u, null, 'FAN', { seasonOf: master })(ev).season, 'heating')
   assert.deepEqual(seen, ['FAN'])
-  const eff = tou.entryEffFor(cfg, tz, u, null, 'FAN')(ev)
+  const eff = effForOf(cfg, tz, u, null, 'FAN')(ev)
   assert.deepEqual([eff.season, eff.suspended, eff.leadMin], ['heating', false, 120], "season unknown ⇒ the 'heating' window; an ON E never suspended")
   // an explicit E*: its mode, as before
   const ex = withSched([{ at: '07:00', power: 'ON', mode: 'COOL', temp: 74 }])
-  assert.equal(tou.entryEffFor(ex.cfg, tz, ex.u, { stranded: { fields: { mode: 'HEAT' } } }, 'HEAT')(ev).season, 'cooling')
+  assert.equal(effForOf(ex.cfg, tz, ex.u, { stranded: { fields: { mode: 'HEAT' } } }, 'HEAT')(ev).season, 'cooling')
 })
 
 test('F plan with opts.runContext: precondition / entry / restore / entries texts of a keep-mode entry (§3.4)', () => {
@@ -1246,7 +1251,7 @@ test('F plan with opts.runContext: precondition / entry / restore / entries text
   const st = { units: {}, ledger: {} }
   const rc = (x) => ({ office: () => x })
   const off = { office: { power: 'OFF', mode: 'FAN', temp: 68, fan: 'LOW' } }
-  const p = tou.plan(cfg, st, tz, MON, { live: off, runContext: rc(RC_HEAT) })
+  const p = planOf(cfg, st, tz, MON, { live: off, runContext: rc(RC_HEAT) })
   const o = p.events[0].units.office
   assert.equal(o.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
   assert.deepEqual([o.preStart, o.target], [ISOL(MON, '05:00'), 71])
@@ -1259,23 +1264,23 @@ test('F plan with opts.runContext: precondition / entry / restore / entries text
   assert.equal(p.markers.find((m) => m.kind === 'folded').lines[0].label, 'On · heat to 68° · Low')
   // running in Cool of its own (rc from the read): already conditioned toward cool to 74°
   const coolRc = { masterMode: 'COOL', mode: 'COOL', season: 'cooling', writeMode: null, source: 'live' }
-  const keeps = tou.plan(cfg, st, tz, MON, { live: { office: { power: 'ON', mode: 'COOL', temp: 68 } }, runContext: rc(coolRc) }).events[0].units.office
+  const keeps = planOf(cfg, st, tz, MON, { live: { office: { power: 'ON', mode: 'COOL', temp: 68 } }, runContext: rc(coolRc) }).events[0].units.office
   assert.deepEqual([keeps.precondition, keeps.target, keeps.restore], ['keeps 68° (already below the 71° target)', null, 'keep mode · 74° · Low'])
   // season unknown: no pre-condition
-  const unk = tou.plan(cfg, st, tz, MON, { live: off, runContext: rc({ masterMode: null, mode: 'FAN', season: null, writeMode: null, source: 'remembered' }) })
+  const unk = planOf(cfg, st, tz, MON, { live: off, runContext: rc({ masterMode: null, mode: 'FAN', season: null, writeMode: null, source: 'remembered' }) })
   assert.equal(unk.events[0].units.office.precondition, 'skip: season unknown')
   assert.deepEqual([unk.entries.office[0].label, unk.entries.office[0].resolved], ['On · cool to 74° / heat to 68° · Low', { season: null }])
   // without opts.runContext: the remembered mode (stranded, then the read), never a written mode
-  const fb = tou.plan(cfg, st, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
+  const fb = planOf(cfg, st, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
   assert.equal(fb.events[0].units.office.precondition, 'cool −3° → 71° from 5:00 (scheduled cool to 74°)')
   assert.deepEqual(fb.entries.office[0].resolved, { season: 'cooling', temp: 74 })
-  const fbS = tou.plan(cfg, { units: { office: { stranded: { fields: { mode: 'HEAT' } } } }, ledger: {} }, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
+  const fbS = planOf(cfg, { units: { office: { stranded: { fields: { mode: 'HEAT' } } } }, ledger: {} }, tz, MON, { live: { office: { power: 'OFF', mode: 'COOL', temp: 76 } } })
   assert.equal(fbS.events[0].units.office.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
   // engaged: auto.entry's season / resolved, the owned bump from the pair's base
   const eng = { units: { office: { auto: { phase: 'precondition', eventId: `${MON}@07:00`, params: { season: 'heating', deltaF: 3, leadMin: 120, source: 'config' },
     entry: { key: `s:${MON}@07:00`, at: ISOL(MON, '07:00'), fields: { power: 'ON', coolTo: 74, heatTo: 68, fan: 'LOW' }, season: 'heating', resolved: { power: 'ON', mode: 'HEAT', temp: 68, fan: 'LOW' } },
     owned: { power: { original: 'OFF', applied: 'ON', status: 'held' }, temp: { original: 68, applied: 71, status: 'held' } }, baseline: { power: 'OFF', mode: 'FAN', temp: 68 } } } } }
-  const pe = tou.plan(cfg, eng, tz, MON, { live: { office: { power: 'ON', mode: 'HEAT', temp: 71 } } }).events[0].units.office
+  const pe = planOf(cfg, eng, tz, MON, { live: { office: { power: 'ON', mode: 'HEAT', temp: 71 } } }).events[0].units.office
   assert.equal(pe.precondition, 'heat +3° → 71° from 5:00 (scheduled heat to 68°)')
   assert.deepEqual([pe.entry.label, pe.entry.resolved, pe.restore], ['On · heat to 68° · Low', { season: 'heating', mode: 'HEAT', temp: 68 }, 'Heat 68° · Low'])
 })
@@ -1284,7 +1289,7 @@ test('F plan: an explicit entry with the pair (the named season), and explicit e
   const rec = withSched([{ at: '07:00', power: 'ON', mode: 'HEAT', heatTo: 70, coolTo: 76 }])
   const live = { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }
   const coolRc = { kitchen: () => ({ masterMode: 'COOL', mode: 'COOL', season: 'cooling', writeMode: 'COOL' }) }
-  const k = tou.plan(rec.cfg, { units: {} }, tz, MON, { live, runContext: coolRc })
+  const k = planOf(rec.cfg, { units: {} }, tz, MON, { live, runContext: coolRc })
   const ku = k.events[0].units.kitchen
   assert.deepEqual([ku.precondition, ku.entry.label, ku.entry.resolved, ku.restore],
     ['heat +3° → 73° from 5:00 (scheduled Heat 70°)', 'On · Heat 70°', { season: 'heating', mode: 'HEAT', temp: 70 }, 'Heat 70°'])
@@ -1294,8 +1299,8 @@ test('F plan: an explicit entry with the pair (the named season), and explicit e
   cfg.precondition.optimumStart = 60
   const throws = () => { throw new Error('read') }
   for (const [date, lv] of [[THU, { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } }], [SAT, {}], [THU, { kitchen: { power: 'OFF', mode: 'COOL', temp: 68 } }]]) {
-    const a = tou.plan(cfg, { units: {}, ledger: {} }, tz, date, { live: lv })
-    const b = tou.plan(cfg, { units: {}, ledger: {} }, tz, date, { live: lv, runContext: { kitchen: throws, office: throws, 'living-room': throws } })
+    const a = planOf(cfg, { units: {}, ledger: {} }, tz, date, { live: lv })
+    const b = planOf(cfg, { units: {}, ledger: {} }, tz, date, { live: lv, runContext: { kitchen: throws, office: throws, 'living-room': throws } })
     assert.equal(JSON.stringify(b), JSON.stringify(a), date)
     assert.ok(!JSON.stringify(a).includes('resolved'))
   }
@@ -1404,7 +1409,7 @@ test('H plan(): instant rows in entries[u] with since/meta/house, a house marker
   cfg.precondition.optimumStart = 60
   const st = { units: {}, ledger: {} }
   const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 70, fan: 'LOW' } }
-  const p = tou.plan(cfg, st, tz, TUE, { live, runContext: { kitchen: () => RC_HEAT } })
+  const p = planOf(cfg, st, tz, TUE, { live, runContext: { kitchen: () => RC_HEAT } })
   const [lh, ret, off] = p.entries.kitchen
   assert.deepEqual(lh, { key: iKey(at), at: ISOL(TUE, '08:10'), atLabel: '8:10', label: 'heat to 62°', fields: { coolTo: 80, heatTo: 62 }, folded: `${TUE}@07:00`,
     resolved: { season: 'heating', temp: 62 }, since: ISOL(TUE, '08:10'), meta: { house: 'left-home' }, house: 'left-home' })
@@ -1416,11 +1421,70 @@ test('H plan(): instant rows in entries[u] with since/meta/house, a house marker
   assert.equal(p.markers.find((x) => x.kind === 'folded').lines[0].house, 'left-home')
   // an Off instant row's dry-out minutes (entryDryOut)
   const d = withRows([{ atMs: L(TUE, '14:05'), power: 'OFF', dryOutMin: 10, since: L(TUE, '14:05') }])
-  const pd = tou.plan(d.cfg, st, tz, TUE, { live: { kitchen: { power: 'ON', mode: 'COOL', temp: 81 } }, now: L(TUE, '14:00') })
+  const pd = planOf(d.cfg, st, tz, TUE, { live: { kitchen: { power: 'ON', mode: 'COOL', temp: 81 } }, now: L(TUE, '14:00') })
   assert.deepEqual(pd.units.kitchen.entryDryOut, { until: ISOL(TUE, '14:15') })
   assert.equal(pd.entries.kitchen[0].dryOutMin, 10)
   // daily rows only: no key of the instant rows appears (J40)
-  const daily = tou.plan(withSched(KITCHEN_SCHED).cfg, st, tz, THU, { live })
+  const daily = planOf(withSched(KITCHEN_SCHED).cfg, st, tz, THU, { live })
   assert.ok(!/"(since|meta|house|dryOutMin)"/.test(JSON.stringify(daily)))
   assert.ok(!daily.markers.some((x) => x.kind === 'house'))
+})
+
+// ---- Addendum G (Release 5): the host injects what a unit kind is — seasonOf required, rules per unit, one bump ----
+test('G: plan / entryEffFor require seasonOf — no silent Daikin season (TypeError)', () => {
+  const cfg = cfgDefault()
+  assert.throws(() => tou.plan(cfg, { units: {} }, tz, THU, { live: {} }), (e) => e instanceof TypeError && e.message === 'seasonOf required')
+  assert.throws(() => tou.entryEffFor(cfg, tz, cfg.units[0], null, 'HEAT'), (e) => e instanceof TypeError && e.message === 'seasonOf required')
+  assert.throws(() => tou.entryEffFor(cfg, tz, cfg.units[0], null, 'HEAT', { seasonOf: 'heating' }), TypeError)
+})
+
+test('G bumpTarget (the one bump, limits injected): heating / water toward the ceiling, cooling toward the floor, moves beyond tol', () => {
+  assert.deepEqual(tou.bumpTarget(68, 'heating', 3, { floor: 41, ceiling: 76 }), { target: 71, moves: true })
+  assert.deepEqual(tou.bumpTarget(120, 'water', 15, { floor: 110, ceiling: 125 }), { target: 125, moves: true }, 'clamped at the scald ceiling')
+  assert.deepEqual(tou.bumpTarget(125, 'water', 15, { floor: 110, ceiling: 125 }), { target: 125, moves: false }, 'already at the ceiling')
+  assert.deepEqual(tou.bumpTarget(74, 'cooling', 3, { floor: 65, ceiling: 90 }), { target: 71, moves: true })
+  assert.deepEqual(tou.bumpTarget(66, 'cooling', 3, { floor: 65, ceiling: 90 }), { target: 65, moves: true })
+  assert.deepEqual(tou.bumpTarget(65.4, 'cooling', 3, { floor: 65, ceiling: 90 }), { target: 65, moves: false }, 'within tol 0.6')
+  assert.deepEqual(tou.bumpTarget(65.4, 'cooling', 3, { floor: 65, ceiling: 90 }, 1, 0), { target: 65, moves: true }, 'tol 0: any move')
+  assert.deepEqual(tou.bumpTarget(68, 'heating', 3, { floor: 41, ceiling: 86 }, 0.5), { target: 71, moves: true })
+  assert.deepEqual(tou.bumpTarget(68, 'heating', 3, null), { target: null, moves: false }, 'no limits (a kind without the season) ⇒ none')
+  assert.deepEqual(tou.bumpTarget(68, null, 3, { floor: 61, ceiling: 90 }), { target: null, moves: false })
+  assert.deepEqual(tou.bumpTarget('x', 'heating', 3, { floor: 61, ceiling: 90 }), { target: null, moves: false })
+})
+
+test('G plan: a setback unit (a Mysa room) — shed \'setback\', no fan-only, no dry-out forecast, its own bump limits and mode gate; heads unchanged', () => {
+  const cfg = cfgDefault()
+  cfg.units.push({ id: 'bathroom', name: 'Bathroom', kind: 'mysa', order: 8, shed: true, precondition: true })
+  const heads = planOf(cfgDefault(), { units: {} }, tz, THU, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 } } })
+  const rules = (u) => (u.kind === 'mysa' ? { shed: 'setback', dryOut: false, preconditionMode: () => true, bumpLimits: (s) => (s === 'heating' ? { floor: 41, ceiling: 74 } : null) } : null)
+  const seasonOfK = (m, u) => (u?.kind === 'mysa' ? 'heating' : seasonOf(m))
+  const live = { kitchen: { power: 'ON', mode: 'HEAT', temp: 70 }, bathroom: { power: 'ON', mode: 'HEAT', temp: 72, caps: { modes: ['HEAT'] } } }
+  const p = tou.plan(cfg, { units: {} }, tz, THU, { live, seasonOf: seasonOfK, unitRules: rules, dryoutSkip: { bathroom: ['Office'] } })
+  const b = p.events[0].units.bathroom
+  assert.deepEqual([b.shed, b.fanOnlyUntil, b.dryout], ['setback', null, null])
+  assert.equal(b.precondition, 'heat +2° → 74° from 5:00', 'the kind\'s ceiling (heatingMax ∩ the device) clamps the bump')
+  assert.equal(p.events[1].units.bathroom.shed, 'setback')
+  assert.deepEqual(p.events[0].units.kitchen, heads.events[0].units.kitchen, 'a head\'s texts are unchanged by a setback unit beside it')
+  // a Mysa under shedMode 'off' sheds 'off' but never dries out
+  const off = tou.plan(cfg, { units: {} }, tz, THU, { live, seasonOf: seasonOfK, unitRules: (u) => (u.kind === 'mysa' ? { ...rules(u), shed: 'off' } : null) })
+  assert.deepEqual([off.events[0].units.bathroom.shed, off.events[0].units.bathroom.fanOnlyUntil], ['off', null])
+  // a mode gate that refuses: skip with the mode
+  const gate = tou.plan(cfg, { units: {} }, tz, THU, { live, seasonOf: seasonOfK, unitRules: (u) => (u.kind === 'mysa' ? { ...rules(u), preconditionMode: () => false } : null) })
+  assert.equal(gate.events[0].units.bathroom.precondition, 'skip: mode HEAT')
+  // preconditions(e): a unit that pre-conditions every event (the water heater, preheatAllPeaks) gets the evening window
+  const all = tou.plan(cfg, { units: {} }, tz, THU, { live, seasonOf: seasonOfK, unitRules: (u) => (u.kind === 'mysa' ? { ...rules(u), preconditions: () => true } : null) })
+  assert.equal(all.events[1].units.bathroom.precondition, 'heat +2° → 74° from 15:00')
+  assert.equal(p.events[1].units.bathroom.precondition, 'off', 'the evening event does not pre-condition by default')
+})
+
+test('G entryEffFor preconditions(e): an event this unit pre-conditions though its flag is off (water.preheatAllPeaks) has a window, engaged too', () => {
+  const cfg = cfgDefault()
+  const u = cfg.units[0]
+  const [, pm] = tou.events(cfg, tz, THU)
+  const plain = effForOf(cfg, tz, u, null, 'HEAT')
+  assert.equal(tou.activeEventFor(cfg, tz, u, L(THU, '16:00'), plain), null, 'the evening peak does not pre-condition')
+  const all = effForOf(cfg, tz, u, null, 'HEAT', { preconditions: () => true })
+  assert.deepEqual(tou.activeEventFor(cfg, tz, u, L(THU, '16:00'), all), { event: pm, phase: 'precondition', preStart: L(THU, '15:00') })
+  const engaged = { auto: { phase: 'precondition', eventId: pm.id, params: { season: 'heating', deltaF: 3, leadMin: 120, source: 'config' } } }
+  assert.equal(tou.activeEventFor(cfg, tz, u, L(THU, '16:00'), effForOf(cfg, tz, u, engaged, 'HEAT', { preconditions: () => true }))?.phase, 'precondition', 'the frozen params keep the window')
 })

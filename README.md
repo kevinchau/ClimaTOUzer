@@ -235,7 +235,8 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `segments(cfg, tz, date)` | gap-filled tier segments `[{tier, start, end, localStart, localEnd}]` |
 | `events(cfg, tz, date)` | the date's events `[{id, date, kind, peakStart, peakEnd, precondition, windows}]` |
 | `firstPreconditionDate(cfg, tz, fromDate, maxDays = 8)` | the first local date with a pre-conditioned event, or null |
-| `preconditionWindow(cfg, tz, event, season, eff?)` | `{preStart, peakStart, leadMin, season}` or null |
+| `preconditionWindow(cfg, tz, event, season, eff?)` | `{preStart, peakStart, leadMin, season}` or null (`eff.precondition`, when set, replaces the event's flag) |
+| `bumpTarget(original, season, deltaF, limits, step = 1, tol = 0.6)` | `{target, moves}`: the pre-conditioning bump clamped into `limits` `{floor, ceiling}` (heating and `'water'` up to the ceiling, cooling down to the floor) |
 | `dryOutUntilFor(cfg, event, season, from?)` | the fan-only dry-out deadline, or null |
 | `tierAt(cfg, tz, now)` | `{kind, since, until}` |
 | `nextBoundaryAfter(cfg, tz, now)` | the next instant at which the schedule can change |
@@ -250,12 +251,12 @@ milliseconds unless noted; `tz` is a `makeTz()` object; each file's header docum
 | `nextEntry(cfg, tz, unitCfg, now, armedAt?)` | the next entry within 24 hours, or null |
 | `eventEntry(cfg, tz, unitCfg, event, preStart, now, armedAt?)` | the entry that sets an event's target, or null |
 | `armedAtOf(state, unitId)` | when the unit's schedule was last armed, or −∞ |
-| `entryEffFor(cfg, tz, unitCfg, unitState, liveMode, opts?)` | `(event) => eff`, per-event parameters for `activeEventFor` |
+| `entryEffFor(cfg, tz, unitCfg, unitState, liveMode, opts)` | `(event) => eff`, per-event parameters for `activeEventFor`; `opts.seasonOf(mode)` is required (a host knows its units' kinds), `opts.preconditions(event)` pre-conditions an event whatever its flag |
 | `keepsMode(fields)`, `hasPair(fields)`, `resolves(fields)` | an On entry that keeps the mode (names none); one that carries `coolTo`/`heatTo`; either |
 | `setpointFor(fields, season)` | the setpoint an entry gives a season: `temp`, else `coolTo` (cooling) / `heatTo` (heating) |
 | `resolveEntry(fields, rc)` | the concrete `{power, mode?, temp?, fan?}` an entry means for a run context `{mode, season, writeMode}` (identity for an entry that names a mode without the pair; a row without power gives `{temp?, fan?}`) |
 | `entryResolution(fields, rc)` | `{season, mode?, temp?}`, the resolution as plans and activity lines show it |
-| `plan(cfg, state, tz, date, opts?)` | one printable day: segments, events with per-unit texts, entries, markers (`opts.runContext` resolves entries that keep the mode) |
+| `plan(cfg, state, tz, date, opts)` | one printable day: segments, events with per-unit texts, entries, markers (`opts.seasonOf(mode, unitCfg)` is required; `opts.unitRules(unitCfg)` describes a unit that sheds by setback or has no dry-out; `opts.runContext` resolves entries that keep the mode) |
 
 **tuning**: parameters, snapshots, the commit-time check
 
