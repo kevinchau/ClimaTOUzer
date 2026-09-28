@@ -179,7 +179,7 @@ is always "more comfortable"):
 
 1. resume a unit that was paused as dormant and is in use again;
 2. hold for the gates: auto-tune off, schedule not live, paused, date locked by a person's revert;
-3. pause pre-conditioning for a unit that has been off for 3 days;
+3. pause pre-conditioning for a unit that has been off for 3 days (days the house was away do not count);
 4. hold when there is no season, the day was already analysed, or yesterday's data is thin;
 5. **UP** on R1 breach (the newest fresh morning left the band, or someone turned the room back on during the shed),
    then R5 overrides (comfort-direction changes on 2 of the last 5 mornings), then R3 forecast (the model is

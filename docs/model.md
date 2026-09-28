@@ -152,6 +152,7 @@ record belongs to the log of the local date of its `t`):
 | `a` | action line | `u`, `ty` type, `ac` actor, `e` event, `f`, `fr`, `to`, `res`, `ph` phase, `se` season, `par` `{deltaF, leadMin}`, … |
 | `p` | tuning change | `u`, `se`, `pa`, `fr`, `to`, `s`, `id` |
 | `b` / `h` | boot snapshot / boot header | unit state at boot, boot id |
+| `m` | house mode (a host's switch to Standard, Left Home or Vacation, and one at boot while a mode is on) | `mode`, `from`, `by`, `u` the units the mode holds (`[]` in Standard) |
 
 `records.mirrorActivity(line)` maps an action line to its `a` record. The lines rollup reads to tell the story of a
 morning are: `phase_enter` (phase `precondition` with `params`, or `shed`), `take` (the automation takes a field:
@@ -165,11 +166,13 @@ Per unit and local day `d` (`rollupDay`), with `band = [comfortLowF, comfortHigh
 - **On time** `onMin[tier] = Σ on/60` (fan-only buckets go to `fanMin`), `offMin[tier] = Σ (cv − on)/60`,
   `unknownMin[tier] = tierMinutes − Σ cv/60`; `coverage = Σ cv / (dayMinutes·60)`.
 - **Setpoint** time-weighted over ON seconds; **room** `{min, max, mean, n}` per tier; **band minutes** inside,
-  below and above the band.
+  below and above the band — minutes the unit was away (held by a house mode other than Standard, rebuilt from the `m`
+  records) are counted apart as `awayMin`, never as a comfort miss.
 - **Changes** by source, **jobs** from `write` / `retry` / `failing` / `blocked` lines.
 - **Outdoor** `{min, max, mean, n, coverage}` with hourly back-fill for missing slots, plus `hdd65`, `cdd65`.
 - **Episodes**: one per event of the day (below).
-- `tail`: the last bucket's state, carried into the next day as `prevTail`.
+- `tail`: the last bucket's state, carried into the next day as `prevTail` (with a house mode still on at midnight:
+  `away` `{mode, since}`, so a Vacation's days are away from their first minute).
 
 Rollups are deterministic: identical inputs give identical bytes.
 
@@ -216,8 +219,15 @@ deduplicated) are tagged `comfortDir` when they push toward comfort (power back 
 in the season's direction, a switch to the season's mode). An external override at the same clock time on 3 or
 more of the last 7 event days is flagged `auto` (probably another automation): surfaced, not counted.
 
+**Away.** An episode is `away` (the mode) when one of the unit's away intervals overlaps its nominal window: from
+the pre-condition it ran, else the pre-condition window the config gives the event, else the peak start, to the peak
+end — the return inside that window included (a house back from Left Home or Vacation pre-conditions nothing for the
+event whose window holds the return). A peak while away says nothing about Δ or the lead: the optimizer leaves it out
+of its evidence and its realisation, and keeps its drift (the room's physics).
+
 **Quality** `q`, first match wins: `dry` (entered in dry run), `forced` (a multi-split master rewrote the unit's
-mode for half or more of the running time), `pre_only` (a boundary episode), `low_coverage`, `flat`, `jump`, `ok`.
+mode for half or more of the running time), `away`, `pre_only` (a boundary episode), `low_coverage`, `flat`, `jump`,
+`ok`.
 
 **Multi-split constraint.** On a system where one outdoor unit serves several indoor units, the master's mode can
 force a follower's. The host passes the constraint to `rollupDay` (`{on, master, forcing, conflict}`); the rollup
@@ -278,7 +288,7 @@ Order of evaluation (first match wins):
 | G2 | schedule not live | hold `not_live` |
 | suspended | still dormant | hold `suspended` |
 | G5 | `applyDate` locked by a person's revert | hold `locked` |
-| R4a dormant | no running minutes for `dormantDays` (3) full days | suspend pre-conditioning |
+| R4a dormant | no running minutes for `dormantDays` (3) full days, none of them away | suspend pre-conditioning |
 | G3 | no season | hold `no_season` |
 | G6 | `D` already analysed | hold `already` |
 | G7 | coverage of `D` below 0.6, or a failing job during the latest episode | hold `low_data` |
