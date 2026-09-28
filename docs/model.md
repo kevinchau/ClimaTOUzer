@@ -139,6 +139,13 @@ The pre-conditioning target is the base setpoint `± deltaF`, clamped to `precon
 heating, `coolingMin` for cooling); `tou.plan` shows that target, and a host skips the run when the clamped target
 does not move in the intended direction.
 
+**Other device kinds are the host's.** The season function is an input (`tou.plan`, `tou.entryEffFor` and
+`activeParams` take the host's `seasonOf`); the bump is `tou.bumpTarget(original, season, deltaF, {floor, ceiling})`
+with the limits the host hands in. A **hot-water tank** runs in a third season, `'water'` (the heating direction): its
+base is `precondition.deltaF.water` / `leadMin.water` (15 °F / 180 min), a tuned value is clamped to `water.tune`
+(Δ 5–25 in steps of 5) and a tuned lead to `water.earliestStart` (03:30), and its ceiling is the host's scald limit
+(`ceilingF`). It has no drift model.
+
 ## 6. Usage records
 
 `rollupDay` reads one local day of records (one JSON object per line in a host's log; `t` in epoch seconds; a
@@ -154,6 +161,9 @@ record belongs to the log of the local date of its `t`):
 | `b` / `h` | boot snapshot / boot header | unit state at boot, boot id |
 | `m` | house mode (a host's switch to Standard, Left Home or Vacation, and one at boot while a mode is on) | `mode`, `from`, `by`, `u` the units the mode holds (`[]` in Standard) |
 
+A host's water heater adds two keys to its `s` records: `rn`, the seconds its heater ran in the bucket, and `hw`, its
+hot-water level (`full`, `some`, `low`); `r` is its tank temperature when it reports one.
+
 `records.mirrorActivity(line)` maps an action line to its `a` record. The lines rollup reads to tell the story of a
 morning are: `phase_enter` (phase `precondition` with `params`, or `shed`), `take` (the automation takes a field:
 `original → applied`), `write` (`from → to`, `result: 'verified'`), `phase_exit`, and a person's `released`,
@@ -164,7 +174,8 @@ morning are: `phase_enter` (phase `precondition` with `params`, or `shed`), `tak
 Per unit and local day `d` (`rollupDay`), with `band = [comfortLowF, comfortHighF] + sensorOffsetF`:
 
 - **On time** `onMin[tier] = Σ on/60` (fan-only buckets go to `fanMin`), `offMin[tier] = Σ (cv − on)/60`,
-  `unknownMin[tier] = tierMinutes − Σ cv/60`; `coverage = Σ cv / (dayMinutes·60)`.
+  `unknownMin[tier] = tierMinutes − Σ cv/60`; `coverage = Σ cv / (dayMinutes·60)`. With `rn` in the buckets (a
+  water heater), `runMin[tier]` is its running time — a tank is ON all day.
 - **Setpoint** time-weighted over ON seconds; **room** `{min, max, mean, n}` per tier; **band minutes** inside,
   below and above the band — minutes the unit was away (held by a house mode other than Standard, rebuilt from the `m`
   records) are counted apart as `awayMin`, never as a comfort miss.
@@ -225,8 +236,17 @@ end — the return inside that window included (a house back from Left Home or V
 event whose window holds the return). A peak while away says nothing about Δ or the lead: the optimizer leaves it out
 of its evidence and its realisation, and keeps its drift (the room's physics).
 
+**Setback episodes.** A unit the host sheds by setback (`rollupDay`'s `unitRules(unitId)` → `{shed: 'setback',
+seasonOf, floorF}`) stays powered on through its peak: the episode is `shedKind 'setback'`, `offAt` is the verified
+shed **setpoint** write, `shed.sp` its setpoint, the comfort points are every reading in `[offAt, shedEnd)` and the
+drift points stop at the first bucket at or below `sp + 1 °F` (the heater restarted). The evidence adds `floorMin`
+(minutes at or below `floorF`, a tank's reading floor — below its thermostat's own restart point, so a normal cycle
+never counts), `lowMin` (minutes at hot-water level `low`), `ranMin` (minutes running) and `levels {first, last}`;
+the recovery is measured from the verified return of the setpoint.
+
 **Quality** `q`, first match wins: `dry` (entered in dry run), `forced` (a multi-split master rewrote the unit's
-mode for half or more of the running time), `away`, `pre_only` (a boundary episode), `low_coverage`, `flat`, `jump`,
+mode for half or more of the running time), `away`, `pre_only` (a boundary episode), `no_sensor` (a setback unit with
+neither a reading nor a hot-water level in the event's window — never evidence), `low_coverage`, `flat`, `jump`,
 `ok`.
 
 **Multi-split constraint.** On a system where one outdoor unit serves several indoor units, the master's mode can
@@ -316,6 +336,12 @@ veto, never lower.
 `clampStep` then applies the hard limits: `deltaF ∈ [minDeltaF, maxDeltaF] ∩ [1, 6]` in steps of at most 1°;
 `leadMin` on the 5-minute grid within `[minLeadMin, peakStart − earliestStart] ∩ [20, 240]`, in steps of at most
 `maxStepLeadMin` (30). A step the clamp cancels becomes a `guardrail` hold.
+
+**The water season.** A tank's evidence is its setback episodes (a breach is `floorMin > 0` or `lowMin > 0`; three
+comfortable peaks step down); there is no forecast rule (R3) and no efficiency fit. Δ moves by `water.tune.stepDeltaF`
+(5°) within `[minDeltaF, maxDeltaF] ∩ [1, 30]` and **never above `ceilingF − median(original)`**: at the ceiling the
+hold is `at_limit`, and the suggestion names the scald limit ("tell the app if a mixing valve is installed"). A tank
+episode without a reading or a level holds `no_sensor`.
 
 **Observe first.** For `observeDays` (3) after the optimizer is enabled, decisions are made and logged as
 proposals (mode `proposed`) but nothing changes.

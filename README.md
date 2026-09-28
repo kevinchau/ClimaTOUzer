@@ -3,7 +3,7 @@
 **Time-of-use pre-conditioning for heat pumps: the rate model, the window math and the learning behind a scheduler
 that banks cheap energy before the peak and coasts through it.**
 
-![tests](https://img.shields.io/badge/tests-492%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-511%20passing-brightgreen)
 ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![node](https://img.shields.io/badge/node-%E2%89%A5%2020-339933)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -69,6 +69,16 @@ through an injected time zone, so results are identical on any machine.
   text (`explain.holdText`).
 - **Validation and defaults.** `validate(cfg)` checks every section the library reads; `defaultConfig()` builds a
   complete starting config.
+- **Device kinds are the host's.** The library never names a device. It knows the two room seasons plus `'water'` (a
+  hot-water tank's regime: a Δ and a lead of its own, its own guardrails, no drift model) and takes everything a
+  device kind decides as input. `tou.plan` and `tou.entryEffFor` require a `seasonOf` (mode → season; there is no
+  built-in Daikin guess); `tou.plan`'s `unitRules` option (per unit config) says how a unit of another kind sheds (`'setback'`),
+  whether it dries out, which events and modes it pre-conditions in, its bump limits and its mode words;
+  `tou.bumpTarget` clamps into the `{floor, ceiling}` it is handed; `tuning.activeParams` takes the host's `seasonOf`;
+  `rollupDay`'s `unitRules(unitId)` marks a setback unit's episodes (`shedKind 'setback'`, `floorMin`, `lowMin`,
+  `ranMin`); `proposeFor` takes a tank's `ceilingF`, so a pre-heat step never passes the scald ceiling, and
+  `explain.holdText('at_limit', {ceilingF})` names it. The reference app injects its kind table this way and the
+  core never imports it.
 
 ## Quick start
 
@@ -205,8 +215,8 @@ The full model, with the rollup math, every episode field and the worked example
 ## Used by
 
 ClimaTOUzer's private home app runs this library in production against six Daikin heat pumps controlled through
-Faikin modules (small boards that put a Daikin indoor unit on the local network); a Rheem heat-pump water heater
-and Mysa thermostats are next. The app owns everything around the library: device I/O and write verification, the
+Faikin modules (small boards that put a Daikin indoor unit on the local network), and — through the same injected
+contract — a Rheem heat-pump water heater and Mysa baseboard thermostats, which it reaches over their makers' clouds. The app owns everything around the library: device I/O and write verification, the
 scheduler loop, persistence, the dashboard and notifications. The library is the part that decides.
 
 ## API reference
@@ -387,7 +397,7 @@ Constants: `TIERS`, `PRECONDITION_MODES`, `PRECONDITION_FANS`, `HOLIDAY_PRESETS`
 npm test            # node --test test/*.test.js
 ```
 
-492 tests, no network, no files written. Every suite that touches wall-clock time re-runs
+511 tests, no network, no files written. Every suite that touches wall-clock time re-runs
 itself under `TZ=UTC` and `TZ=Asia/Tokyo` and must pass unchanged. Beyond the unit tests:
 
 - **Property suites.** The optimizer runs 2 000 seeded contexts (plus 500 focused on the forecast rule), each in
