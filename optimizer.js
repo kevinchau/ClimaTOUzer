@@ -85,6 +85,14 @@
 //     The per-mode setpoint a forced mode change brings back (F rule 12) needs nothing here: the mirror never copies
 //     `recalled`, and a morning forced by the master is already out of E (forcedByMaster).
 //
+// Release 4.3 evidence (Addendum H, A §4.6 / §5.4 — the house modes; rollup Episode.away, UnitRollup.away):
+//   • An away episode (the house was on Left Home or Vacation over its nominal window, the return included) leaves E
+//     (qualifying — so F, every UP/DOWN rule and its evidence: a 61° floor or a missing pre-condition says nothing about
+//     Δ or the lead) and the realisation sample (a return inside the window is no pre-heat). The drift fit KEEPS it:
+//     Newton cooling does not know who is home.
+//   • R4a (dormancy) never counts a day the unit was away (UnitRollup.away): a unit idle through a Vacation was not
+//     unused — its pre-conditioning is not paused behind the person's back, to wait for a resume after the return.
+//
 // Release 4.1 evidence (addendum E E1.15 — the weekend pre-condition's boundary episodes, rollup kind 'boundary'):
 //   • A boundary episode (a weekend/holiday pre-condition toward the super off-peak → off-peak step, no shed) is never E
 //     (qualifying/takesPart — so never F, R1/R2/R5 or any step's evidence: those rules read the shed's comfort class,
@@ -412,11 +420,11 @@ const takesPart = (ep, season) => ep.season === season && ep.precondition === tr
  * dry-run, status ∈ {done, released}, q ≠ 'dry'; newest first. Release 4 (see the header): no preSkipped
  * episode, none forced by the master, and only the newest qualifying episode's preFromOff regime.
  * Release 4.1: never a boundary episode (kind 'boundary', addendum E E1.15).
- * Release 4.2: never a replanned one (Addendum F rule 10, see the header).
+ * Release 4.2: never a replanned one (Addendum F rule 10, see the header). Release 4.3: never an away one (Addendum H).
  */
 export function qualifying(ctx, season) {
   const c = buildContext(ctx)
-  const base = episodesIn(c, c.windowDates).filter((ep) => takesPart(ep, season) && !ep.preSkipped && !ep.replanned && !forcedByMaster(ep))
+  const base = episodesIn(c, c.windowDates).filter((ep) => takesPart(ep, season) && !ep.preSkipped && !ep.replanned && !ep.away && !forcedByMaster(ep))
   const regime = !!base[0]?.preFromOff
   return base.filter((ep) => !!ep.preFromOff === regime)
 }
@@ -454,7 +462,8 @@ export function fresh(ctx, season, eps) {
 
 /**
  * §5.5 drift model over same-season episodes (caller passes the model-window episodes): points
- * (x, y) = (s·(Tout − r̄), s·b) from episodes with drift.ok ∧ !flat ∧ !jump (dry-run excluded).
+ * (x, y) = (s·(Tout − r̄), s·b) from episodes with drift.ok ∧ !flat ∧ !jump (dry-run excluded; an away one kept —
+ * Addendum H: the room's physics).
  * → {kind:'ols'|'none', confident, alpha, beta, r2, n, sigma, sigmaX, xMean, points:[{x, y, date, ev, tout, room}]}
  * confident ⇔ n ≥ 5 ∧ β > 0 ∧ R² ≥ 0.3 ∧ σx ≥ 2; not confident ⇒ kind 'none' (numbers kept for display).
  */
@@ -563,7 +572,8 @@ function forecastFor(c) {
 
 /**
  * zPre = median(s·T0), eff̂ = clamp(median eff, 0.3, 1.0) (default 0.7) over the last 5 same-season pre-episodes —
- * never a preSkipped or forced one, and (`preFromOff` boolean: F[0]'s) only of that regime (B C-3; null = any).
+ * never a preSkipped, forced or away one (Addendum H), and (`preFromOff` boolean: F[0]'s) only of that regime (B C-3;
+ * null = any).
  * Boundary episodes (addendum E E1.15) are included: their T0 and eff are the same measurement as a weekday's.
  * → {zPre, effHat, events}.
  */
@@ -571,7 +581,7 @@ export function realisation(ctx, season, preFromOff = null) {
   const c = buildContext(ctx)
   const s = sgn(season)
   const eps = episodesIn(c, c.modelDates).filter((ep) => ep.season === season && !ep.dryRun && isObj(ep.pre) && isNum(ep.pre.T0) &&
-    !ep.preSkipped && !forcedByMaster(ep) && (preFromOff == null || !!ep.preFromOff === !!preFromOff)).slice(0, REAL_N)
+    !ep.preSkipped && !ep.away && !forcedByMaster(ep) && (preFromOff == null || !!ep.preFromOff === !!preFromOff)).slice(0, REAL_N)
   const zPre = median(eps.map((ep) => s * ep.pre.T0))
   const effMed = median(eps.map((ep) => ep.pre.eff).filter(isNum))
   return { zPre, effHat: clamp(effMed ?? EFF_DEFAULT, EFF_MIN, EFF_MAX), events: eps.map((ep) => ep.ev ?? null) }
@@ -702,7 +712,7 @@ function comfortable(ep, cc) {
   return !!sh && sh.class === 'comfortable' && isNum(sh.cov) && sh.cov >= cc && !(ep.overrides ?? []).some((o) => isObj(o) && o.comfortDir === true)
 }
 
-/** R4a: the last dormantDays closed days each have a rollup with onMin.total = 0 and coverage ≥ 0.5. */
+/** R4a: the last dormantDays closed days each have a rollup with onMin.total = 0 and coverage ≥ 0.5 — none away (H). */
 function dormancy(c) {
   const days = dateRange(c.tz, c.analysisDate, c.dormantDays)
   if (days.length < c.dormantDays) return null
@@ -710,7 +720,7 @@ function dormancy(c) {
     const r = c.rollups.get(d)
     if (r && r.complete === false) return null
     const u = unitRollup(c, d)
-    if (!u || !isNum(u.onMin?.total) || u.onMin.total > 0 || !isNum(u.coverage) || u.coverage < DORMANT_COV) return null
+    if (!u || !isNum(u.onMin?.total) || u.onMin.total > 0 || !isNum(u.coverage) || u.coverage < DORMANT_COV || u.away) return null
   }
   return { since: days[0], days: days.length }
 }

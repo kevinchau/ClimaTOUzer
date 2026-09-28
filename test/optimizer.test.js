@@ -3,6 +3,8 @@
 // evidence freshness, gates, an end-to-end check on real rollups (usage-gen → rollup.js → optimizer),
 // and a seeded property suite over 2 000 contexts (+ its cooling mirror).
 // Release 4.2 (Addendum F rule 10, D-check-6): a replanned episode is never E (qualifying / fresh).
+// Release 4.3 (Addendum H, A §4.6/§5.4): an away episode is never E nor a realisation sample; the drift fit keeps it; a
+// day away is no dormancy evidence.
 //
 // Mirror convention: every scenario is written in the heating view with comfort band 68–78 °F; the
 // cooling twin reflects every room/outdoor temperature about 73 °F (T → 146 − T), flips HEAT → COOL and
@@ -117,9 +119,9 @@ function ep(season, o) {
   return {
     ev: `${o.date}@${at}`, date: o.date, unit: 'office', ...(o.kind ? { kind: o.kind } : {}), peakStart: ps, peakEnd: pe, precondition: o.precondition ?? morning,
     preStart: par ? ps - par.leadMin * 60 : null, status, season: o.season === undefined ? season : o.season, par,
-    dryRun: !!o.dryRun, preSkipped: o.preSkipped ?? null, preFromOff: !!o.preFromOff, ...(o.replanned ? { replanned: true } : {}), pre, shed, rec: null,
+    dryRun: !!o.dryRun, preSkipped: o.preSkipped ?? null, preFromOff: !!o.preFromOff, ...(o.replanned ? { replanned: true } : {}), ...(o.away ? { away: o.away } : {}), pre, shed, rec: null,
     released: status === 'released' ? { t: ps + 1800, by: 'external', f: 'power', v: 'ON' } : null,
-    overrides, jobs: { retries: 0, failing: o.failing ?? 0, blocked: o.blocked ?? 0 }, q: o.q ?? (o.dryRun ? 'dry' : boundary ? 'pre_only' : 'ok'),
+    overrides, jobs: { retries: 0, failing: o.failing ?? 0, blocked: o.blocked ?? 0 }, q: o.q ?? (o.dryRun ? 'dry' : o.away ? 'away' : boundary ? 'pre_only' : 'ok'),
     // addendum C C6.1: forced intervals given as [{mode, sameSeason?, fromMin?, untilMin?}] minutes after preStart
     forced: (o.forced ?? []).map((f) => ({
       from: (par ? ps - par.leadMin * 60 : ps) + (f.fromMin ?? 30) * 60, until: (par ? ps - par.leadMin * 60 : ps) + (f.untilMin ?? 150) * 60,
@@ -145,7 +147,7 @@ function mkRollups(season, eps, { days = {}, end = D, n = 45 } = {}) {
     const on = dd.on ?? 300
     out[d] = {
       v: 1, date: d, complete: true,
-      units: { office: { id: 'office', coverage: dd.cov ?? 0.95, onMin: { peak: 0, off_peak: 0, super_off_peak: on, total: on }, modeMin: modeMinFor(season, dd.modeMin ?? (on > 0 ? { main: on } : {})), episodes: [] } },
+      units: { office: { id: 'office', coverage: dd.cov ?? 0.95, onMin: { peak: 0, off_peak: 0, super_off_peak: on, total: on }, modeMin: modeMinFor(season, dd.modeMin ?? (on > 0 ? { main: on } : {})), episodes: [], ...(dd.away ? { away: [{ mode: dd.away, from: tz.zonedToInstant(d, '00:00') / 1000, until: tz.zonedToInstant(addDays(d, 1), '00:00') / 1000 }] } : {}) } },
     }
   }
   for (const e of eps) if (out[e.date]) out[e.date].units.office.episodes.push(e)
@@ -873,6 +875,29 @@ describe('Release 4.2 evidence (Addendum F rule 10, D-check-6): a re-planned pre
     { eps: [breach({ reached: false, eff: 0.5, Tpk: 72.3, app: 73, replanned: true })] }, HOLD('learning'))
   both('the same morning without the re-plan steps the lead (the control)',
     { eps: [breach({ reached: false, eff: 0.5, Tpk: 72.3, app: 73 })] }, CHANGE('leadMin', 120, 150, 'R1_LEAD'))
+})
+
+describe('Release 4.3 evidence (Addendum H, A §4.6/§5.4): a peak while away is never E', () => {
+  test('qualifying, fresh and the realisation drop an away episode; the drift fit keeps it; episodes without the key are unchanged', () => {
+    for (const season of SEASONS) {
+      const ids = (eps) => eps.map((e) => e.ev)
+      const ctx = mkCtx(season, { eps: [okEp(D, { away: 'left-home' }), okEp(WD[1]), okEp(WD[2], { away: 'vacation', q: 'forced' })] })
+      assert.deepEqual(ids(O.qualifying(ctx, season)), [`${WD[1]}@07:00`], season)
+      assert.deepEqual(ids(O.fresh(ctx, season)), [`${WD[1]}@07:00`], season)
+      assert.deepEqual(O.realisation(ctx, season, false).events, [`${WD[1]}@07:00`], `${season}: a return inside the window is no pre-heat`)
+      const home = mkCtx(season, { eps: [okEp(D), okEp(WD[1])] })
+      assert.deepEqual(ids(O.qualifying(home, season)), [`${D}@07:00`, `${WD[1]}@07:00`], `${season}: no key, as before`)
+      const fit = (eps) => O.proposeFor(mkCtx(season, { eps })).model
+      assert.equal(fit(modelEps().map((e) => ({ ...e, away: 'vacation' }))).n, 6, `${season}: Newton cooling does not know who is home`)
+    }
+  })
+  both('a breach while away never raises — nothing fresh is left: learning', { eps: [breach({ away: 'left-home' })] }, HOLD('learning'))
+  both('the same breach at home raises (the control)', { eps: [breach()] }, CHANGE('deltaF', 3, 4, 'R1_DELTA'))
+  both('three comfortable mornings of a Vacation never step DOWN', { eps: [comfy(WD[0]), comfy(WD[1]), comfy(WD[2])].map((e) => ({ ...e, away: 'vacation' })) }, HOLD('learning'))
+  const idle = { on: 0, cov: 0.9 }
+  both('three idle days on Vacation are no dormancy (the house was away, the unit not unused)',
+    { days: { '2026-10-19': { ...idle, away: 'vacation' }, '2026-10-20': { ...idle, away: 'vacation' }, [D]: { ...idle, away: 'vacation' } } }, HOLD('no_season'))
+  both('one of the three idle days away is enough to hold off R4a', { days: { '2026-10-19': idle, '2026-10-20': idle, [D]: { ...idle, away: 'left-home' } } }, HOLD('no_season'))
 })
 
 describe('stepFor / clampStep (§5.7)', () => {
