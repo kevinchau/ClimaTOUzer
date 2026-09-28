@@ -12,7 +12,7 @@
 //   segments: [{tier, start, end}], events: [{id, peakStart, peakEnd, precondition}],
 //   outdoor: {min, max, mean, n, filled, coverage, hdd65, cdd65},    // coverage = covered slots / slots
 //   outdoorCoverage,                                    // = outdoor.coverage (the §4.5/§4.7 name)
-//   counts: {s, c, a, o, p, b, h, bad},
+//   counts: {s, c, a, o, p, b, h, bad, m?},               // m only on a day with house-mode records (Addendum H)
 //   units: { [unitId]: UnitRollup },
 //   tail:  { [unitId]: Tail } }                          // pass as the next day's `prevTail`
 //
@@ -26,21 +26,33 @@
 //   modeMin: {[mode]: min} (ON minutes only, FAN included), season: 'heating'|'cooling'|null,
 //   setpoint: {mean (time-weighted over ON), min, max, userChanges},
 //   room: {peak|off_peak|super_off_peak|day: {min, max, mean, n}},
-//   band: {L, H, insideMin, belowMin, aboveMin, peakInsideMin, peakCoveredMin, shedInsideMin, shedCoveredMin},
+//   band: {L, H, insideMin, belowMin, aboveMin, peakInsideMin, peakCoveredMin, shedInsideMin, shedCoveredMin, awayMin?},
+//     (Addendum H: a room bucket inside the unit's away intervals counts into awayMin, never into inside/below/above or the
+//      peak counts — the four add up to the covered room minutes; an away episode's shed never counts into shedInside/
+//      shedCovered. awayMin only on a day the unit was away)
 //   changes: {schedule, user, system, external, gapped, total},
 //     (C6.7: a mode `c` record within 90 s of a forced/unforced line of the unit with v ≈ its `to` — never an unforced
 //      how 'person' — is reclassified s 'system': no override, no extMinutes, not a user change)
 //   jobs: {writes, verified, wouldWrite, retries, verifyFail, failing, blocked, recovered, items:[{t, ty, cl, f, message}] (≤ 10)},
 //   params: [{t, se, pa, fr, to, s, id}]                // 'p' records (tuning changes) of the day
 //   spark: {t0, stepMin: 15, room: [n|null], on: [0..1|null]},     // dayMinutes/15 slots (96 on normal days)
-//   episodes: [Episode], boots, cfgSnapshot: {band: [L, H], touRev, system: {master, forcing, conflict}} }
+//   episodes: [Episode], boots,
+//   away?: [{mode: 'left-home'|'vacation', from, until}],   // Addendum H: the unit's away intervals of the day (clipped
+//                                                       // to it, sorted) — the key only on a day the unit was away
+//   cfgSnapshot: {band: [L, H], touRev, system: {master, forcing, conflict}} }
 //
-// Tail = {power, mode, temp, fan, at, ext: [{d, m: [minuteOfDay]}], forced} — last bucket state plus the local
+// Tail = {power, mode, temp, fan, at, ext: [{d, m: [minuteOfDay]}], forced, away?} — last bucket state plus the local
 //   minute-of-day of external overrides on the last ≤ 6 event days (feeds the HomeKit `auto` flag, §4.6,
 //   which needs "the last 7 event days"; chaining it through prevTail keeps rollups pure per day); forced =
 //   {from, mode, by, kind:'rewrite', cause, sameSeason} | null, the forcing still open at the day end (C6.8: the next
-//   day's intervals continue it from local midnight).
+//   day's intervals continue it from local midnight); away = {mode, since} — the unit's away interval still open at the
+//   day end (Addendum H; since = the instant its away stretch began, kept across a Left Home ↔ Vacation switch; the key
+//   only while one is open — a unit with no bucket that day keeps a tail for it).
 //
+// Away intervals (Addendum H, the house modes): the day's `m` records (records.js: {k:'m', t, mode, from, by, u}) in `t`
+//   order, continued from prevTail.away at local midnight — a unit listed in `u` of a mode other than 'standard' is away
+//   in that mode (a record naming the open mode is a no-op, one naming the other mode splits the interval — the stretch
+//   keeps its since); any other record ends it (the return to Standard, or the unit left out of house modes).
 // Forced intervals (addendum C C6.1, forcedIntervals below): 'rewrite' from the unit's forced/unforced `a` lines
 //   (a forced line opens one — a repeated one is a no-op, one naming another mode splits it — an unforced line closes
 //   it), 'standby' from the samples while the constraint is on (a follower bucket with p = 1 in a conditioning mode
@@ -71,6 +83,12 @@
 //    the last one and the first take temp at or after it (the takes before it were un-owned unsent). The key is absent
 //    otherwise (an episode with one phase_enter reads exactly as before); the optimizer leaves such an episode out of E
 //    (its leadUsed runs from the re-plan instant, not par.leadMin),
+//   away?: 'left-home'|'vacation'  (Addendum H, A §4.6: one of the unit's away intervals overlaps the episode's NOMINAL
+//    window [start, peakEnd), start = preStart ?? the event's pre-condition window from the config (a pre-conditioned
+//    event: tou.preconditionWindow with the configured lead — a return inside it pre-conditions nothing, H rule 4b, so the
+//    window is judged as planned, not as run) ?? peakStart; an interval ending in the window counts, at its start too
+//    (the return); the mode of the newest such interval; the key only then — q 'away' after 'dry' and 'forced'. The
+//    episode itself reads as without the key: the optimizer's E and realisation leave it out, the drift fit keeps it),
 //   pre:  {orig, app, dApp, capped, T0, T0room, Tpk, rise, eff, reached, t90, reachedMinBeforePeak, leadUsed} | null,
 //    (orig = take(temp).base ?? fr — the scheduled setpoint when the bump came from an entry; T0room = the measured
 //     room before preStart; T0 = orig for a preFromOff episode (C-3: rise/eff/t90 over the bump above the scheduled
@@ -96,7 +114,7 @@
 //    inside a forced interval that is not a same-season one ∩ p = 1; null without such an interval),
 //   dryoutSkipped: {reason: 'follower_running'|'master_conditioning', units:[ids]} | null   (the event's dryout_skipped line),
 //   jobs: {retries, failing, blocked},
-//   q: 'dry'|'forced'|'pre_only'|'low_coverage'|'flat'|'jump'|'ok' }  // first applicable in that order (C6.2: forced ⇔
+//   q: 'dry'|'forced'|'away'|'pre_only'|'low_coverage'|'flat'|'jump'|'ok' }  // first applicable in that order (C6.2: forced ⇔
 //                                                               // the non-same-season forced intervals cover ≥ 50 % of
 //                                                               // the p = 1 buckets in [preStart ?? peakStart, peakEnd))
 //
@@ -453,6 +471,43 @@ export function forcedIntervals({ buckets, markers, masterBuckets = null, master
   return { intervals, open: tailForced }
 }
 
+// ───────────────────────────── away intervals (Addendum H) ─────────────────────────────
+
+/**
+ * One unit's away intervals of the day (see the header) → {intervals: [{mode, from, until}] sorted, open: {mode, since} |
+ * null (the tail's away)}. marks: the day's `m` records sorted by t; start / end: the day in s.
+ */
+function awayIntervals(marks, unitId, prevTail, start, end) {
+  const intervals = []
+  const pa = prevTail?.away
+  let open = pa && typeof pa.mode === 'string' && pa.mode ? { mode: pa.mode, since: isNum(pa.since) ? Number(pa.since) : start, at: start } : null
+  const close = (t) => { if (t > open.at) intervals.push({ mode: open.mode, from: open.at, until: t }) }
+  for (const m of marks) {
+    const t = Number(m.t)
+    const held = m.mode !== 'standard' && m.u.includes(unitId)
+    if (open && held && m.mode === open.mode) continue // the same mode again (a re-mint, a boot): no-op
+    if (open) close(t)
+    open = held ? { mode: m.mode, since: open?.since ?? t, at: t } : null // Left Home ↔ Vacation: the stretch goes on
+  }
+  if (open) close(end)
+  return { intervals, open: open ? { mode: open.mode, since: open.since } : null }
+}
+
+/**
+ * The start of an episode's nominal window (see the header): the pre-condition it ran, else the window the config gives a
+ * pre-conditioned event, else the peak. e: the event (ms or s), ps: its peakStart in s.
+ */
+function nominalStart(cfg, tz, e, ps, pe, preStart, season) {
+  if (preStart != null) return preStart
+  if (!e.precondition || !cfg?.tou || !tz) return ps
+  try {
+    const w = tou.preconditionWindow(cfg, tz, { ...e, peakStart: ps * 1000, peakEnd: pe * 1000 }, season)
+    return w ? Math.round(w.preStart / 1000) : ps
+  } catch {
+    return ps
+  }
+}
+
 // ───────────────────────────── episodes ─────────────────────────────
 
 function findMarker(M, pred) { for (const a of M) if (pred(a)) return a; return null }
@@ -483,9 +538,11 @@ function comfortDirOf(o, season, offAt) {
  * @param {string} [a.date]
  * @param {Array} [a.forced]  the unit's forced intervals of the day (forcedIntervals().intervals; addendum C C6.1)
  * @param {Function} [a.tierOf]  bucket start (s) → tier (forcedBand.byTier; without it byTier is null)
+ * @param {Array} [a.away]    the unit's away intervals of the day ([{mode, from, until}] in s; Addendum H — see the header)
+ * @param {object} [a.cfg]    the config (the nominal pre-condition window of an away episode; without it the peak)
  * @returns {Array} Episode[]
  */
-export function buildEpisodes({ unitId, buckets, changes, markers, events, band, outdoor, marginF = 1, comfyMarginF = 2, tz, extHistory = [], prevTail = null, date = null, forced = [], tierOf = null }) {
+export function buildEpisodes({ unitId, buckets, changes, markers, events, band, outdoor, marginF = 1, comfyMarginF = 2, tz, extHistory = [], prevTail = null, date = null, forced = [], tierOf = null, away = [], cfg = null }) {
   const B = normBuckets((buckets ?? []).slice())
   const C = (changes ?? []).slice().sort((a, b) => a.t - b.t)
   const A = (markers ?? []).slice().sort((a, b) => a.t - b.t)
@@ -726,13 +783,19 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
       forcedBand = { outMin: 5 * outs.length, worstF: worst ? round1(worst.r) : null, byTier }
     }
 
-    const q = dryRun || status === 'dry' ? 'dry' : forcedQ ? 'forced' : boundary ? 'pre_only' : !shed || shed.cov < 0.6 ? 'low_coverage' : shed.flat ? 'flat' : shed.jump ? 'jump' : 'ok'
+    // Addendum H: away when an away interval overlaps the nominal window (the return, ending inside it, too)
+    let awayMode = null
+    if (away.length) {
+      const a = nominalStart(cfg, tz, e, ps, pe, preStart, season)
+      for (const x of away) if (x.from < (boundary ? ps : pe) && x.until >= a) awayMode = x.mode
+    }
+    const q = dryRun || status === 'dry' ? 'dry' : forcedQ ? 'forced' : awayMode ? 'away' : boundary ? 'pre_only' : !shed || shed.cov < 0.6 ? 'low_coverage' : shed.flat ? 'flat' : shed.jump ? 'jump' : 'ok'
     out.push({
       ev: e.id, date: date ?? (typeof e.id === 'string' ? e.id.split('@')[0] : null), unit: unitId ?? null,
       kind: boundary ? 'boundary' : 'peak', peakStart: ps, peakEnd: pe, precondition: !!e.precondition, preStart,
       status, season, par, dryRun, preSkipped: preNotice ? String(preNotice.rs ?? preNotice.why) : null,
       conditioned: preNotice?.rs === 'already conditioned' ? { keeps: isNum(preNotice.to) ? Number(preNotice.to) : null, target: isNum(preNotice.fr) ? Number(preNotice.fr) : null } : null,
-      preFromOff, ...(replanned ? { replanned: true } : {}),
+      preFromOff, ...(replanned ? { replanned: true } : {}), ...(awayMode ? { away: awayMode } : {}),
       pre, shed, fanOnly, rec,
       released: rel ? { t: Number(rel.t), by: rel.ac === 'dashboard' ? 'user' : 'external', f: rel.f ?? null, v: rel.to ?? null } : null,
       overrides,
@@ -775,8 +838,11 @@ function extMinutes(episodes, tz) {
 const JOB_TYPES = { write: 'Write', retry: 'Retry', failing: 'Failing', blocked: 'Blocked', verify_fail: 'Not applied', recovered: 'Recovered' }
 
 /** One unit's rollup for the day → {rollup: UnitRollup, tail: Tail|null}. */
-function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayMinutes, band, cfg, tz, prevTail, outdoor, date, masterS = null, constraint: c = NO_CONSTRAINT }) {
+function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayMinutes, band, cfg, tz, prevTail, outdoor, date, masterS = null, constraint: c = NO_CONSTRAINT, marks = [] }) {
   const B = normBuckets(S)
+  // Addendum H: the unit's away intervals (the house modes' m records, continued from prevTail.away)
+  const W = awayIntervals(marks, id, prevTail, t0, t0 + dayMinutes * 60)
+  const awayL = W.intervals
   // addendum C C6.1: the unit's forced intervals (the samples rule for a follower while the constraint is on)
   const F = forcedIntervals({
     buckets: B, markers: A, masterBuckets: roleIn(c, cfg, id) === 'follower' ? masterS : null, masterId: c.master,
@@ -808,7 +874,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
   let spW = 0
   let spMin = null
   let spMax = null
-  const bandCnt = { inside: 0, below: 0, above: 0, peakInside: 0, peakCovered: 0 }
+  const bandCnt = { inside: 0, below: 0, above: 0, peakInside: 0, peakCovered: 0, away: 0 }
   for (const b of B) {
     const tier = tierOf(b.t)
     const isFan = b.p === 1 && up(b.m) === 'FAN'
@@ -831,10 +897,13 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
     if (hasRoom(b)) {
       roomT[tier].push(b.r)
       const inside = b.r >= band[0] - 1e-9 && b.r <= band[1] + 1e-9
-      if (inside) bandCnt.inside++
-      else if (b.r < band[0]) bandCnt.below++
-      else bandCnt.above++
-      if (tier === 'peak') { bandCnt.peakCovered++; if (inside) bandCnt.peakInside++ }
+      if (awayL.length && inIntervals(awayL, b.t)) bandCnt.away++ // Addendum H: counted apart, never a comfort miss
+      else {
+        if (inside) bandCnt.inside++
+        else if (b.r < band[0]) bandCnt.below++
+        else bandCnt.above++
+        if (tier === 'peak') { bandCnt.peakCovered++; if (inside) bandCnt.peakInside++ }
+      }
     }
   }
   const unknown = emptyTiers()
@@ -897,13 +966,14 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
   const marginF = isNum(cfg?.optimizer?.marginF) ? Number(cfg.optimizer.marginF) : 1
   const comfyMarginF = isNum(cfg?.optimizer?.comfyMarginF) ? Number(cfg.optimizer.comfyMarginF) : 2
   const extHistory = Array.isArray(prevTail?.ext) ? prevTail.ext : []
-  const episodes = buildEpisodes({ unitId: id, buckets: B, changes: C, markers: A, events: evs, band, outdoor, marginF, comfyMarginF, tz, extHistory, prevTail, date, forced: F.intervals, tierOf })
+  const episodes = buildEpisodes({ unitId: id, buckets: B, changes: C, markers: A, events: evs, band, outdoor, marginF, comfyMarginF, tz, extHistory, prevTail, date, forced: F.intervals, tierOf, away: awayL, cfg })
 
-  // shed-window band minutes (comfort points of participating episodes) — the report's bandPct basis
+  // shed-window band minutes (comfort points of participating episodes) — the report's bandPct basis; a peak while away
+  // is never a comfort miss (Addendum H)
   let shedInside = 0
   let shedCovered = 0
   for (const ep of episodes) {
-    if (!ep.shed || !(ep.status === 'done' || ep.status === 'released')) continue
+    if (!ep.shed || !(ep.status === 'done' || ep.status === 'released') || ep.away) continue
     for (const b of B) {
       if (b.on !== 0 || !hasRoom(b) || !inWin(b.t, ep.shed.offAt, ep.shed.end)) continue
       shedCovered++
@@ -913,12 +983,16 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
 
   let tail
   const last = B[B.length - 1]
+  const away = W.open ? { away: W.open } : {} // Addendum H: an away interval still open at the day end
   if (last) {
     let ext = extHistory.slice()
     if (evs.length) ext = [...ext, { d: date, m: extMinutes(episodes, tz) }]
-    tail = { power: last.p == null ? null : last.p ? 'ON' : 'OFF', mode: last.m, temp: last.sp, fan: last.f, at: last.t, ext: ext.slice(-EXT_DAYS), forced: F.open }
+    tail = { power: last.p == null ? null : last.p ? 'ON' : 'OFF', mode: last.m, temp: last.sp, fan: last.f, at: last.t, ext: ext.slice(-EXT_DAYS), forced: F.open, ...away }
+  } else if (prevTail) {
+    const { away: _prevAway, ...rest } = prevTail // today's intervals decide the away
+    tail = { ...rest, ext: extHistory.slice(-EXT_DAYS), forced: F.open, ...away }
   } else {
-    tail = prevTail ? { ...prevTail, ext: extHistory.slice(-EXT_DAYS), forced: F.open } : null
+    tail = W.open ? { power: null, mode: null, temp: null, fan: null, at: null, ext: [], forced: F.open, ...away } : null
   }
 
   const rollup = {
@@ -944,6 +1018,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
       insideMin: 5 * bandCnt.inside, belowMin: 5 * bandCnt.below, aboveMin: 5 * bandCnt.above,
       peakInsideMin: 5 * bandCnt.peakInside, peakCoveredMin: 5 * bandCnt.peakCovered,
       shedInsideMin: 5 * shedInside, shedCoveredMin: 5 * shedCovered,
+      ...(awayL.length ? { awayMin: 5 * bandCnt.away } : {}),
     },
     changes,
     jobs,
@@ -951,6 +1026,7 @@ function unitRollup({ id, S, C: Craw, A, P, nBoots, segs, tierMin, evs, t0, dayM
     spark: { t0, stepMin: 15, room: sRoom, on: sOn },
     episodes,
     boots: nBoots,
+    ...(awayL.length ? { away: awayL } : {}),
     cfgSnapshot: { band: [band[0], band[1]], touRev: cfg?.rev ?? null, system: { master: c.master, forcing: c.forcing, conflict: c.conflict } },
   }
   return { rollup, tail }
@@ -1000,6 +1076,7 @@ export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdo
     return x
   }
   const oRecs = []
+  const marks = [] // Addendum H: the house modes' m records (every unit reads them: `u` names the units a mode holds)
   const counts = { s: 0, c: 0, a: 0, o: 0, p: 0, b: 0, h: 0, bad: 0 }
   for await (const raw of records ?? []) {
     let r = raw
@@ -1014,6 +1091,7 @@ export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdo
       case 'p': counts.p++; if (typeof r.u === 'string') perUnit(r.u).P.push({ ...r, t }); break
       case 'b': counts.b++; if (typeof r.u === 'string') perUnit(r.u).b++; break
       case 'h': counts.h++; break
+      case 'm': if (typeof r.mode !== 'string' || !Array.isArray(r.u)) { counts.bad++; break } marks.push({ ...r, t }); break
       case 'o': if (isNum(r.f)) { counts.o++; oRecs.push({ t, f: Number(r.f) }) } else counts.bad++; break
       default: counts.bad++
     }
@@ -1041,7 +1119,7 @@ export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdo
     const u = unitRollup({
       id, S: x.S, C: stable(x.C), A: stable(x.A), P: stable(x.P), nBoots: x.b, segs, tierMin, evs: evsMs, t0, dayMinutes,
       band: unitBand(cfg, id), cfg, tz, prevTail: prevTail?.[id] ?? null, outdoor: od.samples, date,
-      masterS: masterId != null && masterId !== id ? per.get(masterId)?.S ?? [] : null, constraint: sys,
+      masterS: masterId != null && masterId !== id ? per.get(masterId)?.S ?? [] : null, constraint: sys, marks: stable(marks),
     })
     units[id] = u.rollup
     tail[id] = u.tail
@@ -1060,7 +1138,7 @@ export async function rollupDay({ date, records, cfg, tz, prevTail = null, outdo
     events: evsMs.map((e) => ({ id: e.id, peakStart: Math.round(e.peakStart / 1000), peakEnd: Math.round(e.peakEnd / 1000), precondition: !!e.precondition })),
     outdoor,
     outdoorCoverage: outdoor.coverage,
-    counts,
+    counts: marks.length ? { ...counts, m: marks.length } : counts,
     units,
     tail,
   }

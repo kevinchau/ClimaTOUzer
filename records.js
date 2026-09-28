@@ -13,6 +13,11 @@
 //      'system', id}
 //   b  a boot snapshot of one unit: {k:'b', t, u, p, m, sp, f, r, boot}
 //   h  a boot header: {k:'h', t, boot}
+//   m  a house mode (Addendum H, a host's `house` line — and one at boot while a mode is on): {k:'m', t, mode:
+//      'standard'|'left-home'|'vacation', from (the previous mode | null), by ('dashboard'|'api'|'timer'|'config' |
+//      null), u: [the unit ids the mode substitutes — its schedule is the mode's; [] in Standard]}. rollup rebuilds each
+//      unit's away intervals from them (a unit in `u` of a mode other than Standard is away) and carries an open one
+//      across midnight in its tail (`tail.away`); the host builds the record (only it knows which units the mode holds).
 //
 // mirrorActivity(entry, nowMs) → the `a` record of an action line, or null when its type is not mirrored. Action lines
 // use the reference app's activity vocabulary (MIRRORED_TYPES): phase_enter / phase_exit (phase 'precondition'|'shed'|
@@ -21,7 +26,7 @@
 // unforced (a multi-split master rewrote a follower's mode), tuning_* and the device/job lines. rollup reads the
 // episode story from them (see rollup.js). `nowMs` stamps a line without a parsable `ts`.
 
-export const RECORD_KINDS = Object.freeze(['s', 'c', 'o', 'a', 'p', 'b', 'h'])
+export const RECORD_KINDS = Object.freeze(['s', 'c', 'o', 'a', 'p', 'b', 'h', 'm'])
 /**
  * Activity types mirrored as `a` records (§3.5); `notice` only for precondition_* codes and for dryout_skipped with
  * reason follower_running / master_conditioning (addendum C §3.4); any `tuning_*` too.

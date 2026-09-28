@@ -1361,3 +1361,129 @@ test('Release 4.2 (Addendum F rule 10, A §4.6): a re-planned precondition — t
   assert.ok(!('replanned' in one), 'no replanned key')
   assert.deepEqual([one.season, one.preStart, one.pre.orig, one.pre.app, one.par], ['cooling', at(D, '05:00'), 74, 71, { deltaF: 3, leadMin: 120 }])
 })
+
+// ─────────────────────────────── Release 4.3 (Addendum H): house modes — away ───────────────────────────────
+
+const HWEEK = ['2026-10-18', '2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23'] // Sun … Fri
+const [HSUN, HMON, HTUE, HWED, HTHU, HFRI] = HWEEK
+/** A whole local day of 5-min OFF buckets of `u` at room 70 (inside the 68–78 band). */
+const allDay = (date, u, r = 70) => buckets(date, '00:00', '12:00', () => ({ u, r, on: 0, p: 0 }))
+  .concat(buckets(date, '12:00', '23:55', () => ({ u, r, on: 0, p: 0 })), [{ k: 's', t: at(date, '23:55'), u, r, n: 15, cv: 300, on: 0, p: 0, m: 'HEAT', sp: 70, f: 'LOW' }])
+/** The `m` record a host writes for a `house` line: the mode and the units it substitutes. */
+const mRec = (date, hhmm, mode, u, o = {}) => ({ k: 'm', t: at(date, hhmm), mode, from: o.from ?? null, by: o.by ?? 'dashboard', u })
+/** cfgWith(ids) with the evening peak pre-conditioned or not (the owner's summer table of H §1.5 (b) pre-conditions it). */
+function cfgH(ids = ['office', 'kitchen'], evening = true) {
+  const cfg = cfgWith(ids)
+  cfg.tou.weekday = cfg.tou.weekday.map((row) => (row.start === '17:00' ? { ...row, precondition: evening } : row))
+  return cfg
+}
+async function chain(byDate, cfg, dates, prevTail = null) {
+  const out = {}
+  let tail = prevTail
+  for (const d of dates) {
+    out[d] = await rollupDay({ date: d, records: byDate[d] ?? [], cfg, tz, prevTail: tail, builtAt: '2026-10-24T08:30:00.000Z' })
+    tail = out[d].tail
+  }
+  return out
+}
+const epAway = (u) => u.episodes.map((e) => [e.ev.split('@')[1], e.away ?? null, e.q])
+const dayEnd = (d) => at(addDays(d, 1), '00:00')
+
+test('Addendum H (A §4.6): a Sunday Vacation marks Monday–Thursday episodes away through tail.away; a unit it does not hold never is; the return at 16:30 marks the 17:00 episode (inside its pre-condition window)', async () => {
+  const byDate = {}
+  for (const d of HWEEK) byDate[d] = [...allDay(d, 'office'), ...allDay(d, 'kitchen')]
+  byDate[HTUE] = allDay(HTUE, 'kitchen') // Tuesday: the office's module is unreachable all day — its tail still carries the away
+  byDate[HSUN].push(mRec(HSUN, '14:00', 'vacation', ['office'], { from: 'standard' })) // the kitchen is left out of house modes
+  byDate[HFRI].push(mRec(HFRI, '16:30', 'standard', [], { from: 'vacation', by: 'timer' }))
+  const r = await chain(byDate, cfgH(), HWEEK)
+  const sun = r[HSUN]
+  assert.equal(sun.counts.m, 1)
+  assert.deepEqual(sun.units.office.away, [{ mode: 'vacation', from: at(HSUN, '14:00'), until: dayEnd(HSUN) }])
+  assert.deepEqual(sun.tail.office.away, { mode: 'vacation', since: at(HSUN, '14:00') })
+  const b = sun.units.office.band
+  assert.deepEqual([b.insideMin, b.belowMin, b.aboveMin, b.awayMin], [840, 0, 0, 600], 'the away buckets are counted apart')
+  assert.equal(b.insideMin + b.belowMin + b.aboveMin + b.awayMin, 5 * sun.units.office.room.day.n, 'the four add up to the covered room minutes')
+  for (const d of HWEEK) {
+    const k = r[d].units.kitchen
+    assert.ok(!('away' in k) && !('awayMin' in k.band) && !('away' in (r[d].tail.kitchen ?? {})), `${d}: the kitchen is never away`)
+    assert.ok(k.episodes.every((e) => !('away' in e) && e.q !== 'away'), `${d}: its episodes neither`)
+  }
+  for (const d of [HMON, HTUE, HWED, HTHU]) {
+    assert.deepEqual(epAway(r[d].units.office), [['07:00', 'vacation', 'away'], ['17:00', 'vacation', 'away']], d)
+    assert.deepEqual(r[d].units.office.away, [{ mode: 'vacation', from: at(d, '00:00'), until: dayEnd(d) }], `${d}: all day`)
+    assert.deepEqual(r[d].tail.office.away, { mode: 'vacation', since: at(HSUN, '14:00') }, `${d}: carried from Sunday`)
+    assert.ok(!('m' in r[d].counts), `${d}: no m record, no count key`)
+  }
+  assert.equal(r[HTUE].units.office.coverage, 0)
+  assert.equal(r[HMON].units.office.band.awayMin, 1440)
+  assert.equal(r[HMON].units.office.band.shedCoveredMin, 0)
+  const fri = r[HFRI].units.office
+  assert.deepEqual(fri.away, [{ mode: 'vacation', from: at(HFRI, '00:00'), until: at(HFRI, '16:30') }])
+  assert.deepEqual(epAway(fri), [['07:00', 'vacation', 'away'], ['17:00', 'vacation', 'away']], 'the return at 16:30 lies in the 17:00 pre-condition window [15:00, 17:00)')
+  assert.ok(!('away' in r[HFRI].tail.office), 'back: no open interval')
+  assert.equal(fri.band.awayMin, 990)
+})
+
+test('Addendum H: the return before the pre-condition window, or before a peak that is not pre-conditioned, leaves the evening episode alone', async () => {
+  const prevTail = { office: { power: 'OFF', mode: 'HEAT', temp: 70, fan: 'LOW', at: at(HTHU, '23:55'), ext: [], forced: null, away: { mode: 'vacation', since: at(HSUN, '14:00') } } }
+  const fri = async (hhmm, evening) => (await rollupDay({ date: HFRI, records: [...allDay(HFRI, 'office'), mRec(HFRI, hhmm, 'standard', [])], cfg: cfgH(['office'], evening), tz, prevTail })).units.office
+  assert.deepEqual(epAway(await fri('14:30', true)).map((x) => x.slice(0, 2)), [['07:00', 'vacation'], ['17:00', null]], 'back at 14:30: the 15:00 pre-condition runs as any day')
+  assert.deepEqual(epAway(await fri('15:00', true)).map((x) => x.slice(0, 2)), [['07:00', 'vacation'], ['17:00', 'vacation']], 'back at the window start: rule 4b ran no pre-condition')
+  assert.deepEqual(epAway(await fri('16:30', false)).map((x) => x.slice(0, 2)), [['07:00', 'vacation'], ['17:00', null]], 'no pre-condition window: the 17:00 peak starts after the return')
+  const late = await fri('17:40', false)
+  assert.deepEqual(epAway(late).map((x) => x.slice(0, 2)), [['07:00', 'vacation'], ['17:00', 'vacation']], 'back inside the peak')
+})
+
+test('Addendum H: Left Home → Vacation splits the interval (the stretch keeps its since); a unit left out mid-mode ends its own; a repeated record is a no-op; a pre-condition the switch ended is away, a dry-run one stays dry', async () => {
+  const D = HWED
+  const recs = [
+    ...allDay(D, 'office'), ...allDay(D, 'kitchen'),
+    mRec(D, '06:00', 'left-home', ['office', 'kitchen'], { from: 'standard', by: 'api' }),
+    mRec(D, '12:00', 'left-home', ['office'], { by: 'config' }), // the kitchen left out of house modes (H1.18)
+    mRec(D, '12:30', 'left-home', ['office'], { by: 'config' }), // a Settings re-mint: the same membership
+    mRec(D, '22:00', 'vacation', ['office', 'kitchen'], { from: 'left-home' }),
+    // the office pre-heated from 05:00 for its 07:00 row; the 06:00 switch ended it (rule 4a)
+    ...lines(D, 'office', `${D}@07:00`, [
+      ['05:00', 0, { type: 'phase_enter', phase: 'precondition', season: 'heating', params: PARAMS_H }],
+      ['05:00', 0, { type: 'take', field: 'temp', original: 70, applied: 73, phase: 'precondition' }],
+      ['05:00', 3, { type: 'write', field: 'temp', from: 70, to: 73, kind: 'take', result: 'verified' }],
+      ['06:00', 0, { type: 'phase_exit', phase: 'precondition', reason: 'house', season: 'heating', house: 'left-home' }],
+    ]),
+    // the kitchen's, entered in dry run
+    ...lines(D, 'kitchen', `${D}@07:00`, [['05:00', 0, { type: 'phase_enter', phase: 'precondition', season: 'heating', params: PARAMS_H, dryRun: true }]]),
+  ]
+  const r = await rollupDay({ date: D, records: recs, cfg: cfgH(['office', 'kitchen'], false), tz })
+  assert.equal(r.counts.m, 4)
+  const { office, kitchen } = r.units
+  assert.deepEqual(office.away, [
+    { mode: 'left-home', from: at(D, '06:00'), until: at(D, '22:00') },
+    { mode: 'vacation', from: at(D, '22:00'), until: dayEnd(D) },
+  ])
+  assert.deepEqual(r.tail.office.away, { mode: 'vacation', since: at(D, '06:00') }, 'one stretch since 06:00')
+  assert.deepEqual(kitchen.away, [
+    { mode: 'left-home', from: at(D, '06:00'), until: at(D, '12:00') },
+    { mode: 'vacation', from: at(D, '22:00'), until: dayEnd(D) },
+  ])
+  assert.deepEqual(r.tail.kitchen.away, { mode: 'vacation', since: at(D, '22:00') })
+  assert.deepEqual(epAway(office), [['07:00', 'left-home', 'away'], ['17:00', 'left-home', 'away']])
+  assert.deepEqual(epAway(kitchen), [['07:00', 'left-home', 'dry'], ['17:00', null, 'low_coverage']], 'dry wins over away; out of the mode by 17:00')
+  assert.equal(office.episodes[0].status, 'done', 'the episode itself reads as before')
+  assert.equal(kitchen.band.awayMin, 5 * (72 + 24))
+})
+
+test('Addendum H: an m record without a mode or a unit list is a bad line; Standard holds nobody; a day without m records reads exactly as before (no away key anywhere)', async () => {
+  const D = HWED
+  const r = await rollupDay({
+    date: D, cfg: cfgH(['office'], false), tz,
+    records: [...allDay(D, 'office'), { k: 'm', t: at(D, '08:00'), u: ['office'] }, { k: 'm', t: at(D, '09:00'), mode: 'vacation' }, mRec(D, '10:00', 'standard', ['office'])],
+  })
+  assert.deepEqual([r.counts.m, r.counts.bad], [1, 2])
+  assert.ok(!('away' in r.units.office) && !('away' in r.tail.office))
+  const g = await gen({ start: DAY, days: 2, seed: 12, units: [{ id: 'office' }, { id: 'kitchen', mode: 'COOL', sp: 74 }] })
+  const a = await roll(g, DAY)
+  const b = await roll(g, '2026-10-15', a.tail)
+  for (const x of [a, b]) {
+    assert.ok(!JSON.stringify(x).includes('"away'), 'no away / awayMin key')
+    assert.ok(!('m' in x.counts))
+  }
+})
