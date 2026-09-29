@@ -78,7 +78,8 @@ through an injected time zone, so results are identical on any machine.
   61–90 °F) and its mode words;
   `tou.bumpTarget` clamps into the `{floor, ceiling}` it is handed; `tuning.activeParams` takes the host's `seasonOf`;
   `rollupDay`'s `unitRules(unitId)` marks a setback unit's episodes (`shedKind 'setback'`, `floorMin`, `lowMin`,
-  `ranMin`); `proposeFor` takes a tank's `ceilingF`, so a pre-heat step never passes the scald ceiling, and
+  `ranMin`), and an event with the host's `preheat_on_elements` notice (a water heater's resistance elements ran during
+  the pre-heat — `records` mirrors it) marks its episode `preElements`; `proposeFor` takes a tank's `ceilingF`, so a pre-heat step never passes the scald ceiling, and
   `explain.holdText('at_limit', {ceilingF})` names it. The reference app injects its kind table this way and the
   core never imports it.
 

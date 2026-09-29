@@ -1546,6 +1546,18 @@ test('G setback episode (the tank): shedKind, season water, offAt = the verified
   assert.equal(plain.units['water-heater'].episodes[0].shedKind, undefined)
 })
 
+test('G preElements: the host\'s preheat_on_elements notice in the event (the tank\'s elements ran during the pre-heat) marks the episode; without it no key', async () => {
+  const D = DAY
+  const note = lines(D, 'water-heater', `${D}@07:00`, [['05:00', 0, { type: 'notice', actor: 'system', code: 'preheat_on_elements', family: 'econet', running: 'Heat Pump + Electric', mode: 'Heat Pump', message: 'x' }]])
+  assert.deepEqual([note[0].ty, note[0].why], ['notice', 'preheat_on_elements'], 'mirrored as an `a` record')
+  const records = [...tankMorning(D), ...note.map((a) => ({ ...a, u: 'water-heater' }))]
+  const ep = (await rollupDay({ date: D, records, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })).units['water-heater'].episodes[0]
+  assert.equal(ep.preElements, true)
+  assert.equal(ep.preSkipped, null, 'never a pre-condition skip')
+  const plain = (await rollupDay({ date: D, records: tankMorning(D), cfg: tankCfg(), tz, unitRules: () => TANK_RULES })).units['water-heater'].episodes[0]
+  assert.ok(!('preElements' in plain))
+})
+
 test('G setback evidence: a tank cycling 115 → 107 → 115 has floorMin 0 (its thermostat\'s restart point); 103 is a floorMin breach; the drift stops at the setback + 1', async () => {
   const cycling = tankMorning(DAY, { shedTank: (i) => 115 - Math.abs(((i % 16) - 8)) })
   const r = await rollupDay({ date: DAY, records: cycling, cfg: tankCfg(), tz, unitRules: () => TANK_RULES })

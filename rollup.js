@@ -72,7 +72,9 @@
 //   verified RETURN temp write after the shed's exit; shed gains {sp, floorMin (minutes at or below the floor), lowMin
 //   (minutes at hot-water level 'low'), ranMin (minutes running, null without rn), levels {first, last} | null}; a
 //   bucket with a level counts for coverage; q 'no_sensor' (after 'pre_only') when the event's window has neither a
-//   reading nor a level. classify / comfortDirOf accept the 'water' season (the heating direction).
+//   reading nor a level. classify / comfortDirOf accept the 'water' season (the heating direction). An episode whose
+//   event has the host's `preheat_on_elements` notice (a water heater ran its resistance elements during the pre-heat;
+//   records mirrors it) carries preElements: true — the key only then.
 //
 // Multi-split constraint (INJECTED — the core imports no device topology): rollupDay({…, constraint}) takes
 //   {on, master, forcing, conflict}. On a multi-split system one outdoor unit serves several indoor units and the
@@ -98,6 +100,7 @@
 //    the last one and the first take temp at or after it (the takes before it were un-owned unsent). The key is absent
 //    otherwise (an episode with one phase_enter reads exactly as before); the optimizer leaves such an episode out of E
 //    (its leadUsed runs from the re-plan instant, not par.leadMin),
+//   preElements?: true  (Addendum G: the event's preheat_on_elements notice — the key only then),
 //   away?: 'left-home'|'vacation'  (Addendum H, A §4.6: one of the unit's away intervals overlaps the episode's NOMINAL
 //    window [start, peakEnd), start = preStart ?? the event's pre-condition window from the config (a pre-conditioned
 //    event: tou.preconditionWindow with the configured lead — a return inside it pre-conditions nothing, H rule 4b, so the
@@ -591,6 +594,7 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
     const would = M.some((a) => a.ty === 'would_write')
     const preNotice = findMarker(M, (a) => a.ty === 'notice' && String(a.why ?? '').startsWith('precondition_'))
     const dryNotice = findMarker(M, (a) => a.ty === 'notice' && a.why === 'dryout_skipped')
+    const elements = M.some((a) => a.ty === 'notice' && a.why === 'preheat_on_elements')
     const owned = !!(pePre || peShed || takeTemp || takePower)
     // dry run: a phase entered in dry run (`dry`), or — lines logged before phase_enter carried it — would_write
     // with no take and no scheduler write. Never a real episode (status 'dry', par null, q 'dry'; §4.6).
@@ -850,7 +854,7 @@ export function buildEpisodes({ unitId, buckets, changes, markers, events, band,
       kind: boundary ? 'boundary' : 'peak', peakStart: ps, peakEnd: pe, precondition: !!e.precondition, preStart,
       status, season, ...(setback ? { shedKind: 'setback' } : {}), par, dryRun, preSkipped: preNotice ? String(preNotice.rs ?? preNotice.why) : null,
       conditioned: preNotice?.rs === 'already conditioned' ? { keeps: isNum(preNotice.to) ? Number(preNotice.to) : null, target: isNum(preNotice.fr) ? Number(preNotice.fr) : null } : null,
-      preFromOff, ...(replanned ? { replanned: true } : {}), ...(awayMode ? { away: awayMode } : {}),
+      preFromOff, ...(replanned ? { replanned: true } : {}), ...(awayMode ? { away: awayMode } : {}), ...(elements ? { preElements: true } : {}),
       pre, shed, fanOnly, rec,
       released: rel ? { t: Number(rel.t), by: rel.ac === 'dashboard' ? 'user' : 'external', f: rel.f ?? null, v: rel.to ?? null } : null,
       overrides,

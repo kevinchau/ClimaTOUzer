@@ -242,7 +242,9 @@ shed **setpoint** write, `shed.sp` its setpoint, the comfort points are every re
 drift points stop at the first bucket at or below `sp + 1 °F` (the heater restarted). The evidence adds `floorMin`
 (minutes at or below `floorF`, a tank's reading floor — below its thermostat's own restart point, so a normal cycle
 never counts), `lowMin` (minutes at hot-water level `low`), `ranMin` (minutes running) and `levels {first, last}`;
-the recovery is measured from the verified return of the setpoint.
+the recovery is measured from the verified return of the setpoint. A host that saw the tank run its resistance
+elements during the pre-heat logs a `preheat_on_elements` notice in the event; `records` mirrors it and the episode
+carries `preElements: true` (the key only then — it is a finding for the person, not evidence).
 
 **Quality** `q`, first match wins: `dry` (entered in dry run), `forced` (a multi-split master rewrote the unit's
 mode for half or more of the running time), `away`, `pre_only` (a boundary episode), `no_sensor` (a setback unit with

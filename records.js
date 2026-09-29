@@ -28,8 +28,9 @@
 
 export const RECORD_KINDS = Object.freeze(['s', 'c', 'o', 'a', 'p', 'b', 'h', 'm'])
 /**
- * Activity types mirrored as `a` records (§3.5); `notice` only for precondition_* codes and for dryout_skipped with
- * reason follower_running / master_conditioning (addendum C §3.4); any `tuning_*` too.
+ * Activity types mirrored as `a` records (§3.5); `notice` only for precondition_* codes, for dryout_skipped with
+ * reason follower_running / master_conditioning (addendum C §3.4) and for preheat_on_elements (a host's water heater
+ * ran its resistance elements during the pre-heat — rollup's episode preElements); any `tuning_*` too.
  */
 export const MIRRORED_TYPES = Object.freeze([
   'take', 'write', 'would_write', 'verify_fail', 'retry', 'failing', 'blocked', 'recovered', 'drop', 'released',
@@ -80,7 +81,7 @@ export function mirrorActivity(entry, nowMs) {
   if (!MIRROR_SET.has(ty) && !ty.startsWith('tuning_')) return null
   const code = String(entry.code ?? '')
   const dryoutSkip = code === 'dryout_skipped' && (entry.reason === 'follower_running' || entry.reason === 'master_conditioning')
-  if (ty === 'notice' && !code.startsWith('precondition_') && !dryoutSkip) return null
+  if (ty === 'notice' && !code.startsWith('precondition_') && !dryoutSkip && code !== 'preheat_on_elements') return null
   const tsMs = typeof entry.ts === 'number' ? entry.ts : Date.parse(entry.ts)
   const t = sec(Number.isFinite(tsMs) ? tsMs : nowMs)
   const par = entry.params && typeof entry.params === 'object'
