@@ -73,7 +73,9 @@ through an injected time zone, so results are identical on any machine.
   hot-water tank's regime: a Δ and a lead of its own, its own guardrails, no drift model) and takes everything a
   device kind decides as input. `tou.plan` and `tou.entryEffFor` require a `seasonOf` (mode → season; there is no
   built-in Daikin guess); `tou.plan`'s `unitRules` option (per unit config) says how a unit of another kind sheds (`'setback'`),
-  whether it dries out, which events and modes it pre-conditions in, its bump limits and its mode words;
+  whether it dries out, which events and modes it pre-conditions in, its bump limits, whether a setpoint can be written
+  back (`backWritable`: a pre-condition never bumps over one the restore could not put back — without rules, a head's
+  61–90 °F) and its mode words;
   `tou.bumpTarget` clamps into the `{floor, ceiling}` it is handed; `tuning.activeParams` takes the host's `seasonOf`;
   `rollupDay`'s `unitRules(unitId)` marks a setback unit's episodes (`shedKind 'setback'`, `floorMin`, `lowMin`,
   `ranMin`); `proposeFor` takes a tank's `ceilingF`, so a pre-heat step never passes the scald ceiling, and

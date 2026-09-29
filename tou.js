@@ -45,8 +45,11 @@
 //   heater pre-heats before every peak): the eff it returns (frozen params too) carries `precondition`, which
 //   preconditionWindow / activeEventFor / eventOverlapping read in place of event.precondition.
 //   plan opts.unitRules?(unitCfg) → {shed?: 'off' | 'setback', dryOut?: bool, preconditions?(event), preconditionMode?(mode),
-//   bumpLimits?(season, caps) → {floor, ceiling} | null, modeText?(mode) → the device's own spelling of a mode} | null —
-//   absent ⇒ a Daikin head's (shed 'off', dry-out, the precondition.modes gate, clampF ∩ 61–90): PlanDay units[id].shed
+//   bumpLimits?(season, caps) → {floor, ceiling} | null, backWritable?(value, caps) → bool, modeText?(mode) → the
+//   device's own spelling of a mode} | null — absent ⇒ a Daikin head's (shed 'off', dry-out, the precondition.modes gate,
+//   clampF ∩ 61–90, a setpoint written back only within 61–90 °F): a bump over a setpoint the restore cannot write back
+//   reads "skip: setpoint 58° out of range" (the host's decide skips it — C8; rules with bumpLimits and no backWritable:
+//   no check). PlanDay units[id].shed
 //   'setback' for a setback unit (still 'opted out' | 'skipped' | 'released' first), fanOnlyUntil / dryout / entryDryOut
 //   none without dry-out. The 'water' season's texts (a hot-water tank): "pre-heat tank +15° → 125° from 4:00" (Δ, the
 //   target, " (scald limit)" when the ceiling clamped it); with modeText, a mode outside the pre-heat modes reads "no
@@ -727,6 +730,9 @@ export function bumpTarget(original, season, deltaF, limits, step = 1, tol = 0.6
   return { target: t, moves: cool ? t < o - tl - 1e-9 : t > o + tl + 1e-9 }
 }
 
+// A head's write-back range in a plan: 61–90 °F (a °C unit's 16–32 °C reads 60.8–89.6) — the parser reads 50–95.
+function headWritable(v) { return Number.isFinite(Number(v)) && Number(v) >= 60.5 && Number(v) <= 90.5 }
+
 // A head's bump limits in a plan (no device caps): clampF ∩ 61–90 — the host's kinds.bumpLimits for a Daikin head.
 function headLimits(season, clampF) {
   if (season === 'cooling') return { floor: Math.max(Number(clampF?.coolingMin ?? 65), 61), ceiling: 90 }
@@ -833,6 +839,11 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   const modes = Array.isArray(cfg?.precondition?.modes) ? cfg.precondition.modes : ['COOL', 'DRY', 'HEAT']
   const preMode = typeof R0.preconditionMode === 'function' ? (m) => !!R0.preconditionMode(m) : (m) => modes.includes(m)
   const limitsOf = typeof R0.bumpLimits === 'function' ? (s, clampF) => R0.bumpLimits(s, live?.caps ?? null, clampF) : headLimits
+  // never a bump over a setpoint the restore cannot write back (the host's decide skips it: 'range'): the host's
+  // backWritable, else a head's 61–90 °F without rules; a kind's own rules without one: no check
+  const backOk = typeof R0.backWritable === 'function' ? (v) => !!R0.backWritable(v, live?.caps ?? null)
+    : typeof R0.bumpLimits === 'function' ? () => true : headWritable
+  const rangeSkip = (v) => `skip: setpoint ${fmtNum(v)}° out of range`
   const sched = eOn ? ` (scheduled ${settingLabel(E.fields, { fan: false, season: eSeason })})` : ''
   const owned = active ? auto.owned?.temp : null
   if (owned && Number.isFinite(Number(owned.original)) && Number.isFinite(Number(owned.applied))) {
@@ -872,6 +883,7 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
       return res
     }
     if (!moves && !running) { res.precondition = s === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
+    if (!backOk(base)) { res.precondition = rangeSkip(base); return res } // the entry's setpoint, else the unit's own
     res.target = kept
     const from = running ? lt : base
     res.precondition = `${verbOf(s)} ${kept < from ? MINUS : '+'}${fmtNum(Math.abs(kept - from))}° → ${fmtNum(kept)}°${tail}${sched}`
@@ -888,6 +900,7 @@ function unitPlan(cfg, tz, e, u, us, ledgerEntry, live, effFn, dryoutSkip, armed
   const { target, moves } = bumpTarget(original, season, deltaF, limitsOf(season, clampF), step, 0)
   if (target == null) { res.precondition = `±${fmtNum(deltaF)}°${tail}`; return res }
   if (!moves) { res.precondition = season === 'cooling' ? 'skip: already at floor' : 'skip: already at ceiling'; return res }
+  if (!backOk(original)) { res.precondition = rangeSkip(original); return res }
   res.target = target
   if (season === 'water') { // the tank: its Δ and the target, and whether the ceiling (the scald limit) cut the bump
     res.precondition = `${verbOf(season)} +${fmtNum(deltaF)}° → ${fmtNum(target)}°${tail}${target < original + deltaF - 1e-9 ? ' (scald limit)' : ''}`

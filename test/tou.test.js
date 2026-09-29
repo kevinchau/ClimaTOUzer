@@ -696,6 +696,17 @@ test('plan: modes, clamps and missing reads', () => {
   assert.equal(txt({ power: 'ON', mode: 'HEAT', temp: 75 }), 'heat +1° → 76° from 5:00') // ceiling 76
   assert.equal(txt({ power: 'ON', mode: 'HEAT', temp: 76 }), 'skip: already at ceiling')
   assert.equal(txt(null), '±3° from 5:00')
+  // C8: never a bump over a setpoint the head cannot be written back to (61–90 °F, the reads go 50–95): decide skips it
+  // (precondition_skipped 'range', round 4 device-client-1), so the plan says so; a host's unitRules.backWritable decides
+  assert.equal(txt({ power: 'ON', mode: 'HEAT', temp: 58 }), 'skip: setpoint 58° out of range')
+  assert.equal(txt({ power: 'ON', mode: 'COOL', temp: 92 }), 'skip: setpoint 92° out of range')
+  assert.equal(txt({ power: 'ON', mode: 'HEAT', temp: 61 }), 'heat +3° → 64° from 5:00')
+  const withRule = (backWritable) => planOf(cfg, null, tz, WED, { live: { kitchen: { power: 'ON', mode: 'HEAT', temp: 58 } }, unitRules: () => ({ backWritable }) }).events[0].units.kitchen.precondition
+  assert.equal(withRule(() => true), 'heat +3° → 61° from 5:00', 'the host says 58° can be written back')
+  assert.equal(withRule((v) => v >= 60), 'skip: setpoint 58° out of range')
+  const on = structuredClone(cfg)
+  on.units[0].schedule = [{ at: '07:00', power: 'ON', mode: 'HEAT', days: 'all' }] // names no setpoint: the unit's own goes back
+  assert.equal(planOf(on, null, tz, WED, { live: { kitchen: { power: 'OFF', mode: 'HEAT', temp: 58 } } }).events[0].units.kitchen.precondition, 'skip: setpoint 58° out of range')
   cfg.precondition.modes = ['HEAT']
   assert.equal(txt({ power: 'ON', mode: 'COOL', temp: 74 }), 'skip: mode COOL')
 })
