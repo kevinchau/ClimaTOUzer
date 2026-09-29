@@ -792,14 +792,20 @@ function setChange(res, change, observe) {
 /**
  * "today 5:00 AM" / "Mon 5:00 AM" — local start of the new window on the first pre-conditioning
  * morning on/after applyDate (a weekend/holiday applyDate has none — unless the weekend pre-condition is on, addendum
- * E E1.13: then that morning is the first affected one; a tuned LEAD ⇒ ≥ earliestStart, addendum D X1: a Δ step never
- * moves the base start).
+ * E E1.13: then that morning is the first affected one, and its window ends at the boundary — the weekend table's
+ * super off-peak → off-peak step, not the weekday peak start (E-5); a tuned LEAD ⇒ ≥ earliestStart, addendum D X1: a
+ * Δ step never moves the base start).
  */
 function startWhen(c, leadMin, tunedLead) {
   if (!c.applyDate || !isNum(leadMin)) return null
-  const startMin = tunedLead ? Math.max(c.peakStartMin - leadMin, c.guardrails.earliestStartMin ?? 0) : c.peakStartMin - leadMin
   let date = c.applyDate
   try { date = tou.firstPreconditionDate(c.cfg, c.tz, c.applyDate) ?? c.applyDate } catch { /* keep applyDate */ }
+  let peakMin = c.peakStartMin
+  try {
+    const first = tou.events(c.cfg, c.tz, date).find((e) => e.precondition)
+    if (first?.kind === 'boundary') peakMin = c.tz.localParts(Number(first.peakStart)).minuteOfDay
+  } catch { /* keep the weekday peak start */ }
+  const startMin = tunedLead ? Math.max(peakMin - leadMin, c.guardrails.earliestStartMin ?? 0) : peakMin - leadMin
   let time = ''
   try { time = c.tz.formatLocal(c.tz.zonedToInstant(date, startMin), 'time') } catch { time = T.clockLabel(startMin) }
   return `${dayWord(c.tz, c.today, date)} ${time}`.trim()

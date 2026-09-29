@@ -715,6 +715,18 @@ describe('rationale snapshots (shared/insights-text.js wording)', () => {
     assert.equal(vet.change.applyDate, '2026-11-11')
     assert.equal(vet.change.rationale, 'Office rose to 79.5° during Tue\'s morning peak (ceiling 78°). Pre-cool −3° → −4° from tomorrow 5:00 AM.')
   })
+  // E-5 (4.1 review): with the weekend pre-condition on, a Saturday apply date's first pre-conditioning morning is the
+  // boundary's — its start is the boundary minus the lead (a user weekend table's 08:00 ⇒ 6:00), not the weekday peak's
+  test('E-5: the weekend pre-condition on — "from …" is the boundary\'s start on a user weekend table (08:00 ⇒ 6:00 AM), the default table keeps 5:00 AM', () => {
+    const sat = (table) => O.proposeFor(mkCtx('heating', { now: tz.zonedToInstant('2026-10-24', '01:30'), eps: [breach({ date: '2026-10-23' })], cfg: (c) => {
+      if (table) c.tou.weekendHoliday = table
+      c.precondition.superOffPeak = { weekend: true }
+    } }))
+    const late = sat([{ start: '08:00', end: '23:00', tier: 'off_peak' }])
+    assert.equal(late.change.evidence.fromLabel, 'today 6:00 AM')
+    assert.match(late.change.rationale, /from today 6:00 AM\.$/)
+    assert.equal(sat(null).change.evidence.fromLabel, 'today 5:00 AM', 'the default 07:00 boundary')
+  })
   test('R1_LEAD (bump not realised) and R1 lead at max Δ', () => {
     const a = O.proposeFor(mkCtx('heating', { eps: [breach({ reached: false, eff: 0.5, Tpk: 72.3, app: 73 })] }))
     assert.equal(a.change.rationale, 'Office only reached 72.3° of its 73° target by 7:00. Pre-heat now starts 4:30 (was 5:00).')
